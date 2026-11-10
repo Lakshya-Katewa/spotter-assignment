@@ -2,7 +2,8 @@
 
 All stations (~6.6k) are loaded once per process into numpy arrays and a
 KD-tree over 3D unit vectors, so geographic radius queries are exact and a
-corridor search over a cross-country route takes a few milliseconds.
+corridor search over a cross-country route takes a few milliseconds. The index
+is rebuilt when `load_stations` publishes a new DatasetVersion.
 """
 
 import threading
@@ -11,7 +12,8 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.spatial import cKDTree
 
-from fuel.models import FuelStation
+from fuel.models import DatasetVersion, FuelStation
+from fuel.services import highways
 from fuel.services.geo import EARTH_RADIUS_MI
 
 _lock = threading.Lock()
@@ -40,14 +42,17 @@ class Candidate:
     mile: float  # distance from the start along the route
     offset_miles: float  # distance from the route line
     price: float
+    highways: frozenset  # I-/US- highways named in the station's address
 
 
 class StationIndex:
-    def __init__(self, rows):
+    def __init__(self, rows, version="none"):
+        self.version = version
         self.ids = np.array([r[0] for r in rows], dtype=np.int64)
         self.lat = np.array([r[1] for r in rows], dtype=float)
         self.lon = np.array([r[2] for r in rows], dtype=float)
         self.price = np.array([float(r[3]) for r in rows], dtype=float)
+        self.highways = [highways.from_address(r[4]) for r in rows]
         self.tree = cKDTree(_to_xyz(self.lat, self.lon)) if rows else None
 
     def __len__(self):
@@ -72,7 +77,7 @@ class StationIndex:
         # Position each nearby station at its closest route point.
         dist, nearest = cKDTree(route_xyz).query(self.tree.data[idx])
         candidates = [
-            Candidate(int(self.ids[i]), float(cum[n]), float(_arc_miles(d)), float(self.price[i]))
+            Candidate(int(self.ids[i]), float(cum[n]), float(_arc_miles(d)), float(self.price[i]), self.highways[i])
             for i, n, d in zip(idx, nearest, dist)
         ]
         candidates.sort(key=lambda c: (c.mile, c.price))
@@ -109,12 +114,15 @@ def densify(coordinates, step_miles=1.0):
     return pts, cum
 
 
-def get_index() -> StationIndex:
+def get_index(version: str | None = None) -> StationIndex:
+    """The station index for the current dataset version (rebuilt if it changed)."""
     global _index
-    if _index is None:
+    version = version or DatasetVersion.current()
+    if _index is None or _index.version != version:
         with _lock:
-            if _index is None:
-                _index = StationIndex(list(FuelStation.objects.values_list("opis_id", "lat", "lon", "price")))
+            if _index is None or _index.version != version:
+                rows = list(FuelStation.objects.values_list("opis_id", "lat", "lon", "price", "address"))
+                _index = StationIndex(rows, version)
     return _index
 
 

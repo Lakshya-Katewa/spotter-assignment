@@ -11,6 +11,7 @@ import csv
 import io
 import json
 import time
+import uuid
 import zipfile
 from decimal import Decimal
 from pathlib import Path
@@ -20,7 +21,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from fuel.models import FuelStation, Place
+from fuel.models import DatasetVersion, FuelStation, Place
 from fuel.services.names import CANADIAN_PROVINCES, name_variants, place_key
 
 DATA = Path(settings.BASE_DIR) / "data"
@@ -80,6 +81,9 @@ class Command(BaseCommand):
         with transaction.atomic():
             FuelStation.objects.all().delete()
             FuelStation.objects.bulk_create(objs, batch_size=2000)
+            DatasetVersion.objects.update_or_create(
+                pk=1, defaults={"version": uuid.uuid4().hex, "station_count": len(objs)}
+            )
 
         self.stdout.write(self.style.SUCCESS(f"Loaded {len(objs)} stations ({skipped} skipped: city not geocoded)."))
         if missing:

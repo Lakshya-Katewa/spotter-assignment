@@ -138,15 +138,21 @@ OSRM_URL = os.getenv("OSRM_URL", "https://router.project-osrm.org").rstrip("/")
 NOMINATIM_URL = os.getenv("NOMINATIM_URL", "https://nominatim.openstreetmap.org/search")
 HTTP_USER_AGENT = os.getenv("HTTP_USER_AGENT", "fuel-route-planner/1.0 (Django assessment)")
 EXTERNAL_TIMEOUT = float(os.getenv("EXTERNAL_TIMEOUT", "20"))
+GEOCODE_CACHE_SECONDS = int(os.getenv("GEOCODE_CACHE_SECONDS", str(30 * 24 * 3600)))
+GEOCODE_NEGATIVE_CACHE_SECONDS = int(os.getenv("GEOCODE_NEGATIVE_CACHE_SECONDS", "3600"))
+GEOCODE_MAX_WAIT_SECONDS = float(os.getenv("GEOCODE_MAX_WAIT_SECONDS", "5"))
 
 VEHICLE_MAX_RANGE_MILES = float(os.getenv("VEHICLE_MAX_RANGE_MILES", "500"))
 VEHICLE_MPG = float(os.getenv("VEHICLE_MPG", "10"))
-# Stations are placed at city centroids, so allow some distance from the route line.
-STATION_CORRIDOR_MILES = float(os.getenv("STATION_CORRIDOR_MILES", "10"))
-# The tank starts empty: the first fill-up must be within this many route miles.
+# Stations are placed at city centroids. Search this far from the route, but accept a
+# station only if its address names a highway the route uses nearby, or its city
+# centroid is within STATION_NEAR_ROUTE_MILES of the route.
+STATION_CORRIDOR_MILES = float(os.getenv("STATION_CORRIDOR_MILES", "15"))
+STATION_NEAR_ROUTE_MILES = float(os.getenv("STATION_NEAR_ROUTE_MILES", "2"))
+# Default start ("nearly empty"): the first fill-up must be within this many route miles.
 ORIGIN_STATION_WINDOW_MILES = float(os.getenv("ORIGIN_STATION_WINDOW_MILES", "30"))
 # Skip a fuel stop when it saves less than this many dollars (0 = strictly cheapest plan).
-MIN_STOP_SAVINGS = float(os.getenv("MIN_STOP_SAVINGS", "5"))
+MIN_STOP_SAVINGS = float(os.getenv("MIN_STOP_SAVINGS", "0"))
 ROUTE_CACHE_SECONDS = int(os.getenv("ROUTE_CACHE_SECONDS", str(24 * 3600)))
 
 CACHES = {

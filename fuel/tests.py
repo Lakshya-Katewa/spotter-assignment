@@ -1,111 +1,132 @@
+import copy
+import math
+import random
+import time
 from decimal import Decimal
 from unittest import mock
 
+import requests
 from django.core.cache import cache
 from django.test import SimpleTestCase, TestCase, override_settings
 
-from fuel.models import FuelStation, Place
-from fuel.services import routing
-from fuel.services.geo import LocationError, resolve
+from fuel.models import DatasetVersion, FuelStation, Place
+from fuel.services import geo, highways, routing
+from fuel.services.boundary import contains
+from fuel.services.geo import GeocoderUnavailable, LocationError, resolve
 from fuel.services.names import name_variants, normalize, place_key
-import copy
-
 from fuel.services.optimizer import NoFeasiblePlan, consolidate_stops, plan_fuel_stops, simulate
 from fuel.services.polyline import decode, simplify
 from fuel.services.stations import densify, reset_index
 
+TANK = 50  # gallons: 500-mile range at 10 mpg
 
+
+# -- helpers -----------------------------------------------------------------
 def brute_force_cost(stations, total, rng, mpg, start_fuel):
     """Exact optimum by DP over (station, integer fuel miles). Small inputs only."""
     pts = sorted(stations, key=lambda s: s[1])
-    import math
-
-    best = {}  # (index, fuel_miles) -> min cost
+    best = {}
 
     def go(i, fuel):
-        key = (i, fuel)
-        if key in best:
-            return best[key]
+        if (i, fuel) in best:
+            return best[(i, fuel)]
         _, here, price = pts[i]
         result = math.inf
         if total - here <= rng:
-            need = max(0, total - here - fuel)
-            result = need / mpg * price
+            result = max(0, total - here - fuel) / mpg * price
         for j in range(i + 1, len(pts)):
             dist = pts[j][1] - here
             if dist > rng:
                 break
             for buy in range(max(0, dist - fuel), rng - fuel + 1):
                 result = min(result, buy / mpg * price + go(j, fuel + buy - dist))
-        best[key] = result
+        best[(i, fuel)] = result
         return result
 
     return min(go(i, start_fuel - pts[i][1]) for i in range(len(pts)) if pts[i][1] <= start_fuel)
 
 
+def assert_feasible(test, plan, total_miles, mpg=10, tank=TANK):
+    """Drive the plan: never run dry, never overfill, and fuel adds up."""
+    arrivals = simulate(plan.stops, mpg, plan.start_fuel_gallons)
+    for k, (s, arrival) in enumerate(zip(plan.stops, arrivals)):
+        test.assertGreaterEqual(arrival, -1e-6, f"ran dry before stop {k}")
+        test.assertLessEqual(arrival + s.gallons, tank + 1e-6, f"overfilled at stop {k}")
+    last_mile, fuel = (plan.stops[-1].mile, arrivals[-1] + plan.stops[-1].gallons) if plan.stops else (0, plan.start_fuel_gallons)
+    test.assertAlmostEqual(fuel - (total_miles - last_mile) / mpg, plan.end_fuel_gallons, places=6)
+    test.assertAlmostEqual(plan.start_fuel_gallons + plan.total_gallons - plan.end_fuel_gallons, total_miles / mpg, places=6)
+
+
+# -- optimizer ---------------------------------------------------------------
 class OptimizerTests(SimpleTestCase):
     def test_short_trip_buys_only_what_is_needed(self):
         plan = plan_fuel_stops([("a", 0, 3.0)], total_miles=200, max_range_miles=500, mpg=10)
-        self.assertEqual(len(plan.stops), 1)
         self.assertAlmostEqual(plan.total_gallons, 20)
         self.assertAlmostEqual(plan.total_cost, 60)
 
     def test_buys_just_enough_to_reach_cheaper_station(self):
-        stations = [("exp", 0, 4.0), ("cheap", 100, 3.0)]
-        plan = plan_fuel_stops(stations, total_miles=400, max_range_miles=500, mpg=10)
-        self.assertEqual([s.key for s in plan.stops], ["exp", "cheap"])
-        self.assertAlmostEqual(plan.stops[0].gallons, 10)  # 100 miles to the cheaper station
-        self.assertAlmostEqual(plan.stops[1].gallons, 30)
-        self.assertAlmostEqual(plan.total_cost, 10 * 4 + 30 * 3)
+        plan = plan_fuel_stops([("exp", 0, 4.0), ("cheap", 100, 3.0)], total_miles=400, max_range_miles=500, mpg=10)
+        self.assertEqual([(s.key, round(s.gallons, 6)) for s in plan.stops], [("exp", 10), ("cheap", 30)])
 
     def test_fills_up_when_current_station_is_cheapest(self):
         stations = [("cheap", 0, 2.0), ("mid", 450, 3.0), ("exp", 600, 5.0)]
         plan = plan_fuel_stops(stations, total_miles=900, max_range_miles=500, mpg=10)
-        self.assertAlmostEqual(plan.stops[0].gallons, 50)  # full tank at the cheapest
-        self.assertEqual(plan.stops[1].key, "mid")  # cheapest reachable, not the nearest/farthest
-        self.assertAlmostEqual(plan.total_gallons, 90)
+        self.assertAlmostEqual(plan.stops[0].gallons, 50)
+        self.assertEqual(plan.stops[1].key, "mid")
 
     def test_gap_longer_than_range_is_reported(self):
         with self.assertRaises(NoFeasiblePlan) as ctx:
             plan_fuel_stops([("a", 0, 3.0), ("b", 600, 3.0)], total_miles=900, max_range_miles=500, mpg=10)
         self.assertEqual(ctx.exception.gap_start_mile, 0)
 
-    def test_no_station_near_start(self):
+    def test_no_station_reachable_on_start_fuel(self):
         with self.assertRaises(NoFeasiblePlan):
-            plan_fuel_stops([("a", 50, 3.0)], total_miles=900, max_range_miles=500, mpg=10, start_fuel_miles=30)
+            plan_fuel_stops([("a", 50, 3.0)], total_miles=900, max_range_miles=500, mpg=10, start_fuel_gallons=3)
+        with self.assertRaises(NoFeasiblePlan):
+            plan_fuel_stops([("a", 50, 3.0)], total_miles=900, max_range_miles=500, mpg=10, origin_window_miles=30)
 
-    def test_total_gallons_cover_whole_trip(self):
-        stations = [(i, m, p) for i, (m, p) in enumerate([(0, 3.2), (120, 3.0), (300, 3.5), (480, 2.8), (700, 3.1), (950, 3.3)])]
-        plan = plan_fuel_stops(stations, total_miles=1200, max_range_miles=500, mpg=10)
-        self.assertAlmostEqual(plan.total_gallons, 120)
+    def test_regression_no_purchase_exceeds_tank(self):
+        # Previously the 30 miles driven to the first pump were billed there on top of a
+        # full tank: a 53-gallon "purchase" for a 50-gallon tank.
+        plan = plan_fuel_stops([("a", 30, 2.0), ("b", 520, 3.0)], total_miles=1000, max_range_miles=500, mpg=10, origin_window_miles=30)
+        self.assertAlmostEqual(plan.start_fuel_gallons, 3)
+        self.assertAlmostEqual(plan.stops[0].gallons, 50)
+        self.assertAlmostEqual(plan.total_gallons, 97)  # bought; 100 consumed, 3 came from the tank
+        assert_feasible(self, plan, 1000)
 
-    def test_empty_start_pays_for_every_mile(self):
+    def test_nearly_empty_start_picks_cheapest_in_window(self):
         stations = [("near", 5, 3.0), ("nearer_expensive", 2, 4.0), ("mid", 300, 3.1)]
         plan = plan_fuel_stops(stations, total_miles=700, max_range_miles=500, mpg=10, origin_window_miles=30)
-        self.assertEqual(plan.stops[0].key, "near")  # cheapest within the window
-        self.assertAlmostEqual(plan.total_gallons, 70)  # includes the 5 miles to reach it
+        self.assertEqual(plan.stops[0].key, "near")
+        self.assertAlmostEqual(plan.start_fuel_gallons, 0.5)
+        assert_feasible(self, plan, 700)
 
-    def test_paid_start_fuel_matches_brute_force(self):
-        import random
+    def test_given_start_fuel_is_tracked(self):
+        plan = plan_fuel_stops([("a", 100, 3.0), ("b", 400, 2.5)], total_miles=700, max_range_miles=500, mpg=10, start_fuel_gallons=20)
+        self.assertAlmostEqual(plan.start_fuel_gallons, 20)
+        self.assertAlmostEqual(plan.end_fuel_gallons, 0)
+        assert_feasible(self, plan, 700)
+        enough = plan_fuel_stops([("a", 100, 3.0)], total_miles=300, max_range_miles=500, mpg=10, start_fuel_gallons=40)
+        self.assertEqual(enough.stops, [])
+        self.assertAlmostEqual(enough.end_fuel_gallons, 10)
 
+    def test_start_fuel_validated(self):
+        with self.assertRaises(ValueError):
+            plan_fuel_stops([("a", 0, 3.0)], total_miles=100, max_range_miles=500, mpg=10, start_fuel_gallons=51)
+
+    def test_given_start_fuel_matches_brute_force(self):
         rnd = random.Random(11)
         for _ in range(25):
             total = rnd.randint(150, 400)
             stations = [(f"s{k}", rnd.randint(1, total - 1), round(rnd.uniform(2.5, 4.0), 2)) for k in range(8)]
             start = rnd.randint(30, 100)
             try:
-                plan = plan_fuel_stops(stations, total_miles=total, max_range_miles=100, mpg=10, start_fuel_miles=start)
+                plan = plan_fuel_stops(stations, total_miles=total, max_range_miles=100, mpg=10, start_fuel_gallons=start / 10)
             except NoFeasiblePlan:
                 continue
-            first = min(s[1] for s in stations)
-            # Brute force from the first station with the leftover starting fuel.
-            self.assertAlmostEqual(
-                plan.total_cost, brute_force_cost(stations, total, 100, 10, start) if first <= start else 0, places=6
-            )
+            self.assertAlmostEqual(plan.total_cost, brute_force_cost(stations, total, 100, 10, start), places=6)
 
     def test_matches_brute_force_optimum(self):
-        import random
-
         rnd = random.Random(7)
         for _ in range(25):
             total = rnd.randint(150, 400)
@@ -118,56 +139,46 @@ class OptimizerTests(SimpleTestCase):
             self.assertAlmostEqual(plan.total_cost, brute_force_cost(stations, total, 100, 10, 0), places=6)
 
 
-def assert_feasible(test, plan, total_miles, mpg, tank):
-    """Simulate the trip: the tank never runs dry or overflows, and every mile is fuelled."""
-    arrivals = simulate(plan.stops, mpg)
-    for k, (s, arrival) in enumerate(zip(plan.stops, arrivals)):
-        if k:
-            test.assertGreaterEqual(arrival, -1e-6, f"ran dry before stop {k}")
-        test.assertLessEqual(max(arrival, 0) + s.gallons - (s.mile / mpg if k == 0 else 0), tank + 1e-6, f"overflow at stop {k}")
-    last = plan.stops[-1]
-    test.assertAlmostEqual(arrivals[-1] + last.gallons, (total_miles - last.mile) / mpg, places=6)
-
-
 class ConsolidationTests(SimpleTestCase):
     def test_removes_tiny_top_up(self):
         # Like Texarkana -> Hooks: a small top-up 12 miles before a slightly cheaper station.
         stations = [("a", 0, 2.93), ("b", 476, 2.857), ("c", 488, 2.817), ("d", 900, 3.5)]
         plan = plan_fuel_stops(stations, total_miles=950, max_range_miles=500, mpg=10, origin_window_miles=30)
         self.assertEqual([s.key for s in plan.stops], ["a", "b", "c"])
-        merged = consolidate_stops(copy.deepcopy(plan), mpg=10, tank_gallons=50, min_stop_savings=5)
+        merged = consolidate_stops(copy.deepcopy(plan), mpg=10, tank_gallons=TANK, min_stop_savings=5)
         self.assertEqual([s.key for s in merged.stops], ["a", "c"])
         self.assertLess(merged.total_cost - plan.total_cost, 5)
-        self.assertAlmostEqual(merged.total_gallons, 95)
-        assert_feasible(self, merged, 950, 10, 50)
+        assert_feasible(self, merged, 950)
 
     def test_zero_threshold_keeps_cheapest_plan(self):
         stations = [("a", 0, 2.93), ("b", 476, 2.857), ("c", 488, 2.817)]
         plan = plan_fuel_stops(stations, total_miles=950, max_range_miles=500, mpg=10, origin_window_miles=30)
-        merged = consolidate_stops(copy.deepcopy(plan), mpg=10, tank_gallons=50, min_stop_savings=0)
+        merged = consolidate_stops(copy.deepcopy(plan), mpg=10, tank_gallons=TANK, min_stop_savings=0)
         self.assertEqual(len(merged.stops), len(plan.stops))
 
     def test_random_routes_stay_feasible(self):
-        import random
-
         rnd = random.Random(3)
-        for _ in range(200):
+        for n in range(200):
             total = rnd.randint(300, 3000)
             stations = [(k, rnd.uniform(0, total), round(rnd.uniform(2.7, 4.2), 3)) for k in range(rnd.randint(20, 200))]
             stations.append(("origin", 1.0, 3.5))
+            start = None if n % 2 else rnd.uniform(0.2, TANK)
             try:
-                plan = plan_fuel_stops(stations, total_miles=total, max_range_miles=500, mpg=10, origin_window_miles=30)
+                plan = plan_fuel_stops(
+                    stations, total_miles=total, max_range_miles=500, mpg=10, start_fuel_gallons=start, origin_window_miles=30
+                )
             except NoFeasiblePlan:
                 continue
-            assert_feasible(self, plan, total, 10, 50)
+            assert_feasible(self, plan, total)
             for threshold in (2, 10, 50):
-                merged = consolidate_stops(copy.deepcopy(plan), mpg=10, tank_gallons=50, min_stop_savings=threshold)
-                assert_feasible(self, merged, total, 10, 50)
+                merged = consolidate_stops(copy.deepcopy(plan), mpg=10, tank_gallons=TANK, min_stop_savings=threshold)
+                assert_feasible(self, merged, total)
                 self.assertGreaterEqual(merged.total_cost, plan.total_cost - 1e-6)
                 removed = len(plan.stops) - len(merged.stops)
                 self.assertLess(merged.total_cost - plan.total_cost, threshold * max(removed, 1) + 1e-6)
 
 
+# -- pure helpers ------------------------------------------------------------
 class NameTests(SimpleTestCase):
     def test_variants_strip_one_descriptor_at_a_time(self):
         self.assertIn(normalize("Bay City"), name_variants("Bay City city"))
@@ -182,7 +193,6 @@ class NameTests(SimpleTestCase):
 
 class GeometryTests(SimpleTestCase):
     def test_polyline_decode(self):
-        # Example from Google's polyline documentation.
         self.assertEqual(decode("_p~iF~ps|U_ulLnnqC_mqNvxq`@"), [[-120.2, 38.5], [-120.95, 40.7], [-126.453, 43.252]])
 
     def test_simplify_drops_collinear_points(self):
@@ -190,98 +200,297 @@ class GeometryTests(SimpleTestCase):
 
     def test_densify_spacing_and_length(self):
         pts, cum = densify([[-100.0, 40.0], [-100.0, 41.0]], step_miles=1.0)
-        self.assertAlmostEqual(cum[-1], 69.09, places=1)  # 1 degree of latitude
+        self.assertAlmostEqual(cum[-1], 69.09, places=1)
         self.assertLessEqual(max(cum[1:] - cum[:-1]), 1.0 + 1e-9)
 
 
+class HighwayTests(SimpleTestCase):
+    def test_address_refs(self):
+        self.assertEqual(highways.from_address("I-44, EXIT 283 & US-69"), {"I44", "US69"})
+        self.assertEqual(highways.from_address("US-46/US-1/US-9"), {"US46", "US1", "US9"})
+        self.assertEqual(highways.from_address("IH-35 EXIT 4"), {"I35"})
+        self.assertEqual(highways.from_address("SR- 60 & FL TURNPIKE, EXIT 193"), set())
+
+    def test_osrm_refs_and_spans(self):
+        self.assertEqual(highways.from_osrm_ref("I 30; US 70"), {"I30", "US70"})
+        spans = highways.spans_from_steps([{"distance": 1609.344 * 10, "ref": "I 5"}, {"distance": 1609.344 * 5, "ref": "US 99"}], 1609.344)
+        self.assertEqual(highways.refs_near(spans, 3, 1), {"I5"})
+        self.assertEqual(highways.refs_near(spans, 14, 1), {"US99"})
+
+
+class BoundaryTests(SimpleTestCase):
+    def test_points_on_both_sides_of_the_borders(self):
+        inside = {"Detroit": (42.3314, -83.0458), "San Ysidro": (32.555, -117.045), "El Paso": (31.7619, -106.485),
+                  "Honolulu": (21.3069, -157.8583), "Anchorage": (61.2181, -149.9003), "Key West": (24.5551, -81.78)}
+        outside = {"Toronto": (43.6532, -79.3832), "Windsor ON": (42.3149, -83.0364), "Tijuana": (32.5149, -117.0382),
+                   "Juarez": (31.6904, -106.4245), "Vancouver": (49.2827, -123.1207), "Atlantic": (39.5, -72.0)}
+        for name, (lat, lon) in inside.items():
+            self.assertTrue(contains(lat, lon), name)
+        for name, (lat, lon) in outside.items():
+            self.assertFalse(contains(lat, lon), name)
+
+
+# -- routing HTTP client -----------------------------------------------------
+def osrm_response(status=200, payload=None, json_error=False):
+    r = mock.Mock(status_code=status)
+    if json_error:
+        r.json.side_effect = ValueError("not json")
+    else:
+        r.json.return_value = payload
+    return r
+
+
+OSRM_OK = {
+    "code": "Ok",
+    "routes": [{
+        "distance": 160934.4,  # 100 miles
+        "duration": 5400,
+        "geometry": "_p~iF~ps|U_ulLnnqC",
+        "legs": [{"steps": [{"distance": 120701, "ref": "I 5; US 99"}, {"distance": 40233.4, "ref": ""}]}],
+    }],
+}
+
+
+class RoutingClientTests(SimpleTestCase):
+    def setUp(self):
+        cache.clear()
+
+    @mock.patch("fuel.services.routing.requests.get")
+    def test_single_request_with_expected_params_then_cached(self, get):
+        get.return_value = osrm_response(payload=OSRM_OK)
+        route = routing.get_route(38.5, -120.2, 40.7, -120.95)
+        self.assertEqual(get.call_count, 1)
+        url = get.call_args.args[0]
+        params = get.call_args.kwargs["params"]
+        self.assertTrue(url.endswith("/route/v1/driving/-120.2,38.5;-120.95,40.7"), url)
+        self.assertEqual((params["overview"], params["geometries"], params["steps"]), ("full", "polyline", "true"))
+        self.assertAlmostEqual(route.distance_miles, 100)
+        self.assertEqual(route.coordinates, [[-120.2, 38.5], [-120.95, 40.7]])
+        self.assertEqual(route.highways[0][2], {"I5", "US99"})
+        self.assertFalse(route.from_cache)
+
+        again = routing.get_route(38.5, -120.2, 40.7, -120.95)
+        self.assertEqual(get.call_count, 1)
+        self.assertTrue(again.from_cache)
+
+    @mock.patch("fuel.services.routing.requests.get")
+    def test_upstream_failures(self, get):
+        cases = [
+            (osrm_response(400, {"code": "NoRoute", "message": "Impossible route"}), 422),
+            (osrm_response(500, {"code": "InternalError"}), 502),
+            (osrm_response(200, {"code": "Ok", "routes": []}), 502),
+            (osrm_response(502, json_error=True), 502),
+            (requests.ConnectionError("down"), 502),
+            (requests.Timeout("slow"), 502),
+        ]
+        for i, (effect, status) in enumerate(cases):
+            get.reset_mock()
+            get.side_effect = effect if isinstance(effect, Exception) else None
+            get.return_value = None if isinstance(effect, Exception) else effect
+            with self.assertRaises(routing.RoutingError) as ctx:
+                routing.get_route(38.5 + i, -120.2, 40.7, -120.95)
+            self.assertEqual(ctx.exception.status, status, i)
+            self.assertEqual(get.call_count, 1)
+
+
+# -- geocoding ---------------------------------------------------------------
+def nominatim(lat, lon, label="Somewhere, USA"):
+    r = mock.Mock(status_code=200)
+    r.raise_for_status.return_value = None
+    r.json.return_value = [{"lat": str(lat), "lon": str(lon), "display_name": label}] if lat is not None else []
+    return r
+
+
+@override_settings(GEOCODE_MAX_WAIT_SECONDS=3)
+class GeocodingTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        Place.objects.create(key=place_key("Washington", "DC"), name="Washington", state="DC", lat=38.904, lon=-77.016)
+
+    def setUp(self):
+        cache.clear()
+
+    @mock.patch("fuel.services.geo.requests.get")
+    def test_city_state_is_local(self, get):
+        for q in ["Washington, DC", "washington, District of Columbia", "Washington, DC, USA", "Washington, DC 20500"]:
+            self.assertEqual(resolve(q).source, "local", q)
+        get.assert_not_called()
+
+    @mock.patch("fuel.services.geo.requests.get")
+    def test_street_address_is_geocoded_not_collapsed_to_city(self, get):
+        get.return_value = nominatim(38.8977, -77.0365, "White House")
+        loc = resolve("1600 Pennsylvania Ave NW, Washington, DC")
+        self.assertEqual(loc.source, "nominatim")
+        self.assertAlmostEqual(loc.lat, 38.8977)
+        self.assertEqual(get.call_count, 1)
+
+    @mock.patch("fuel.services.geo.requests.get")
+    def test_results_are_cached_including_misses(self, get):
+        get.return_value = nominatim(38.8977, -77.0365)
+        resolve("1600 Pennsylvania Ave NW, Washington, DC")
+        self.assertEqual(resolve("1600  pennsylvania ave nw, washington, dc").source, "nominatim-cache")
+        get.return_value = nominatim(None, None)
+        for _ in range(2):
+            with self.assertRaises(LocationError):
+                resolve("Nowhere Street 1, Atlantis")
+        self.assertEqual(get.call_count, 2)
+
+    @mock.patch("fuel.services.geo.requests.get")
+    def test_rate_limited_to_one_request_per_second(self, get):
+        get.return_value = nominatim(38.8977, -77.0365)
+        t0 = time.monotonic()
+        resolve("1 First St, Washington, DC")
+        resolve("2 Second St, Washington, DC")
+        self.assertGreaterEqual(time.monotonic() - t0, 0.9)
+        self.assertEqual(get.call_count, 2)
+
+    @override_settings(GEOCODE_MAX_WAIT_SECONDS=0.1)
+    @mock.patch("fuel.services.geo.requests.get")
+    def test_busy_limiter_returns_503_instead_of_exceeding_rate(self, get):
+        cache.add(geo._RATE_KEY, 1, timeout=60)
+        with self.assertRaises(GeocoderUnavailable) as ctx:
+            resolve("3 Third St, Washington, DC")
+        self.assertEqual(ctx.exception.status, 503)
+        get.assert_not_called()
+
+    @mock.patch("fuel.services.geo.requests.get", side_effect=requests.ConnectionError("down"))
+    def test_geocoder_outage_is_503(self, _):
+        r = self.client.get("/api/route/", {"start": "4 Fourth St, Washington, DC", "finish": "Washington, DC"})
+        self.assertEqual(r.status_code, 503)
+
+    @mock.patch("fuel.services.geo.requests.get")
+    def test_foreign_results_rejected(self, get):
+        with self.assertRaises(LocationError):
+            resolve("43.6532,-79.3832")  # Toronto: inside the old bounding box
+        get.return_value = nominatim(42.3149, -83.0364)  # a geocoder hit in Windsor, ON
+        with self.assertRaises(LocationError):
+            resolve("Some Street, Windsor")
+
+
+# -- API ---------------------------------------------------------------------
 def fake_route(*_args, **_kwargs):
-    # Straight north-south line from (40N, -100W) to (50N, -100W) ~ 691 miles (router output; endpoints need not match exactly).
-    return routing.Route(distance_miles=691.0, duration_seconds=36000, coordinates=[[-100.0, 40.0], [-100.0, 50.0]])
+    # Straight line north along -100W from 40N; the route is "I-99" the whole way.
+    return routing.Route(
+        distance_miles=691.0,
+        duration_seconds=36000,
+        coordinates=[[-100.0, 40.0], [-100.0, 50.0]],
+        highways=[(0.0, 691.0, frozenset({"I99"}))],
+    )
 
 
-@override_settings(ORIGIN_STATION_WINDOW_MILES=30, STATION_CORRIDOR_MILES=10)
+@override_settings(ORIGIN_STATION_WINDOW_MILES=30, STATION_CORRIDOR_MILES=15, STATION_NEAR_ROUTE_MILES=2, MIN_STOP_SAVINGS=0)
 class ApiTests(TestCase):
     @classmethod
     def setUpTestData(cls):
         Place.objects.create(key=place_key("Southtown", "NE"), name="Southtown", state="NE", lat=40.0, lon=-100.0)
-        Place.objects.create(key=place_key("Northtown", "ND"), name="Northtown", state="ND", lat=48.99, lon=-100.0)
+        Place.objects.create(key=place_key("Northtown", "ND"), name="Northtown", state="ND", lat=48.9, lon=-100.0)
         rows = [
-            (1, "START STOP", 40.05, -100.0, "3.50"),
-            (2, "MIDWAY CHEAP", 43.0, -100.02, "2.90"),
-            (3, "FAR OFF ROUTE", 43.0, -95.0, "1.00"),  # ~250 miles away: must be ignored
-            (4, "NORTH STOP", 46.5, -100.0, "3.20"),
+            (1, "START STOP", "MAIN ST", 40.05, -100.0, "3.50"),        # on the line: near route
+            (2, "MIDWAY CHEAP", "I-99, EXIT 200", 43.0, -100.02, "2.90"),
+            (3, "FAR OFF ROUTE", "I-99", 43.0, -95.0, "1.00"),          # ~250 mi away: outside corridor
+            (4, "NORTH STOP", "MAIN ST", 46.5, -100.0, "3.20"),
+            (5, "OFF ROUTE NO HWY", "SR-5", 44.0, -100.15, "1.50"),     # ~7 mi off, no highway evidence
+            (6, "OFF ROUTE ON HWY", "I-99 EXIT 300", 45.0, -100.15, "2.50"),  # ~7 mi off, but at an I-99 exit
+            (7, "OFF ROUTE WRONG HWY", "I-12 EXIT 9", 45.5, -100.15, "1.00"),
         ]
-        for opis, name, lat, lon, price in rows:
+        for opis, name, address, lat, lon, price in rows:
             FuelStation.objects.create(
-                opis_id=opis, name=name, address="I-00", city="X", state="NE", price=Decimal(price), lat=lat, lon=lon
+                opis_id=opis, name=name, address=address, city="X", state="NE", price=Decimal(price), lat=lat, lon=lon
             )
+        DatasetVersion.objects.create(pk=1, version="v1", station_count=len(rows))
 
     def setUp(self):
         cache.clear()
         reset_index()
 
+    def get(self, **params):
+        return self.client.get("/api/route/", {"start": "Southtown, NE", "finish": "Northtown, ND", **params})
+
     @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
     def test_plan_endpoint(self, get_route):
-        r = self.client.get("/api/route/", {"start": "Southtown, NE", "finish": "48.9,-100"})
+        r = self.get()
         self.assertEqual(r.status_code, 200, r.content)
         data = r.json()
-        names = [s["name"] for s in data["fuel_stops"]]
-        self.assertEqual(names[0], "START STOP")
-        self.assertIn("MIDWAY CHEAP", names)
-        self.assertNotIn("FAR OFF ROUTE", names)
-        self.assertAlmostEqual(data["summary"]["total_gallons"], 69.1, places=1)
-        self.assertEqual(data["meta"]["external_calls"]["routing"], 1)
-        self.assertIn("/map/?", data["map_url"])
+        stops = {s["name"]: s for s in data["fuel_stops"]}
+        self.assertEqual(list(stops)[0], "START STOP")
+        self.assertEqual(stops["START STOP"]["access"], "near route")
+        self.assertEqual(stops["MIDWAY CHEAP"]["access"], "on I99")
+        self.assertIn("OFF ROUTE ON HWY", stops)
+        for rejected in ("FAR OFF ROUTE", "OFF ROUTE NO HWY", "OFF ROUTE WRONG HWY"):
+            self.assertNotIn(rejected, stops)
 
-        # Second identical request is served from cache: no routing call.
-        r2 = self.client.get("/api/route/", {"start": "Southtown, NE", "finish": "48.9,-100"})
+        s = data["summary"]
+        self.assertAlmostEqual(s["fuel_consumed_gallons"], 69.1, places=1)
+        self.assertAlmostEqual(s["starting_fuel_gallons"] + s["fuel_purchased_gallons"] - s["fuel_left_at_arrival_gallons"],
+                               s["fuel_consumed_gallons"], places=1)
+        for stop in data["fuel_stops"]:
+            self.assertLessEqual(stop["fuel_on_arrival_gallons"] + stop["gallons_purchased"], TANK + 0.01)
+        self.assertTrue(s["is_estimate"])
+        self.assertEqual(data["meta"]["external_calls"], {"routing": 1, "geocoding": 0})
+
+        r2 = self.get()
         self.assertTrue(r2.json()["meta"]["cached"])
+        self.assertEqual(r2.json()["meta"]["external_calls"]["routing"], 0)
         self.assertEqual(get_route.call_count, 1)
 
     @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
-    def test_post_and_no_geometry(self, _):
-        r = self.client.post(
-            "/api/route/", {"start": "Southtown, NE", "finish": "Northtown, ND", "geometry": False}, content_type="application/json"
-        )
+    def test_default_is_strictly_cheapest(self, _):
+        s = self.get().json()["summary"]
+        self.assertEqual(s["total_fuel_cost"], s["cheapest_possible_cost"])
+        self.assertEqual(s["extra_cost_for_fewer_stops"], 0)
+
+    @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
+    def test_start_fuel_param(self, _):
+        s = self.get(start_fuel_gallons=50).json()["summary"]
+        self.assertEqual(s["starting_fuel_gallons"], 50)
+        self.assertAlmostEqual(s["fuel_purchased_gallons"], 69.1 - 50, places=1)
+        self.assertEqual(self.get(start_fuel_gallons=51).status_code, 400)
+        self.assertEqual(self.get(start_fuel_gallons=-1).status_code, 400)
+
+    @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
+    def test_params_validated(self, _):
+        self.assertEqual(self.get(min_stop_savings=-1).status_code, 400)
+        page = self.client.get("/map/", {"start": "Southtown, NE", "finish": "Northtown, ND", "min_stop_savings": "nan"})
+        self.assertEqual(page.status_code, 400)
+        self.assertEqual(self.client.get("/api/route/", {"start": "Southtown, NE"}).status_code, 400)
+
+    @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
+    def test_post_without_geometry(self, _):
+        r = self.client.post("/api/route/", {"start": "Southtown, NE", "finish": "Northtown, ND", "geometry": False},
+                             content_type="application/json")
         self.assertEqual(r.status_code, 200, r.content)
         self.assertNotIn("geometry", r.json()["route"])
 
-    @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
-    def test_min_stop_savings_param(self, _):
-        r = self.client.get("/api/route/", {"start": "Southtown, NE", "finish": "Northtown, ND", "min_stop_savings": 0})
-        summary = r.json()["summary"]
-        self.assertEqual(summary["extra_cost_for_fewer_stops"], 0)
-        self.assertEqual(summary["total_fuel_cost"], summary["cheapest_possible_cost"])
-        bad = self.client.get("/api/route/", {"start": "Southtown, NE", "finish": "Northtown, ND", "min_stop_savings": -1})
-        self.assertEqual(bad.status_code, 400)
-        page = self.client.get("/map/", {"start": "Southtown, NE", "finish": "Northtown, ND", "min_stop_savings": "nan"})
-        self.assertEqual(page.status_code, 400)
-
-    def test_missing_params(self):
-        self.assertEqual(self.client.get("/api/route/", {"start": "Southtown, NE"}).status_code, 400)
-
     def test_rejects_non_us(self):
-        r = self.client.get("/api/route/", {"start": "Toronto, ON", "finish": "Southtown, NE"})
-        self.assertEqual(r.status_code, 400)
-        r = self.client.get("/api/route/", {"start": "51.5,-0.12", "finish": "Southtown, NE"})
-        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.client.get("/api/route/", {"start": "Toronto, ON", "finish": "Southtown, NE"}).status_code, 400)
+        self.assertEqual(self.client.get("/api/route/", {"start": "43.65,-79.38", "finish": "Southtown, NE"}).status_code, 400)
 
-    @mock.patch("fuel.services.routing.get_route", side_effect=routing.RoutingError("No route found"))
-    def test_routing_failure(self, _):
-        r = self.client.get("/api/route/", {"start": "Southtown, NE", "finish": "Northtown, ND"})
-        self.assertEqual(r.status_code, 422)
+    def test_routing_errors_map_to_status(self):
+        for status in (422, 502):
+            with mock.patch("fuel.services.routing.get_route", side_effect=routing.RoutingError("x", status=status)):
+                cache.clear()
+                self.assertEqual(self.get().status_code, status)
 
     @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
-    def test_map_page(self, _):
+    def test_new_dataset_version_invalidates_index_and_plan_cache(self, _):
+        before = self.get().json()
+        FuelStation.objects.filter(opis_id=2).update(price=Decimal("1.00"))
+        self.assertEqual(self.get().json()["summary"], before["summary"])  # same version: cached
+
+        DatasetVersion.objects.filter(pk=1).update(version="v2")
+        after = self.get().json()
+        self.assertFalse(after["meta"]["cached"])
+        self.assertEqual(after["meta"]["station_dataset_version"], "v2")
+        self.assertLess(after["summary"]["total_fuel_cost"], before["summary"]["total_fuel_cost"])
+
+    @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
+    def test_map_page_escapes_data(self, _):
+        evil = '</script><script>alert(1)</script><img src=x onerror=alert(2)>'
+        FuelStation.objects.filter(opis_id=1).update(name=evil)
         r = self.client.get("/map/", {"start": "Southtown, NE", "finish": "Northtown, ND"})
         self.assertEqual(r.status_code, 200)
-        self.assertContains(r, "MIDWAY CHEAP")
-        self.assertContains(r, "leaflet")
-
-    def test_local_resolution_needs_no_network(self):
-        with mock.patch("fuel.services.geo.requests.get") as get:
-            loc = resolve("southtown, nebraska")
-            get.assert_not_called()
-        self.assertEqual(loc.source, "local")
-        with self.assertRaises(LocationError):
-            resolve("")
+        html = r.content.decode()
+        self.assertNotIn("<script>alert(1)", html)
+        self.assertNotIn("<img src=x", html)
+        self.assertIn('id="plan-data"', html)
+        self.assertNotIn("innerHTML", html)

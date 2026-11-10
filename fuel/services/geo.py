@@ -2,18 +2,27 @@
 
 Accepted inputs, tried in order:
   1. "lat,lon"                    -> used as-is (no lookup)
-  2. "City, ST" / "City, State"   -> local Census place table (no network)
-  3. anything else (addresses)    -> one Nominatim call, restricted to the US
+  2. exactly "City, ST" / "City, State" (optionally ", USA")
+                                  -> local Census place table (no network)
+  3. anything else (addresses)    -> Nominatim, restricted to the US. Results are
+     cached, and calls are rate-limited to 1/second (Nominatim usage policy).
+
+Every result must fall inside the US national boundary (checked offline).
 """
 
+import hashlib
 import math
 import re
+import threading
+import time
 from dataclasses import dataclass
 
 import requests
 from django.conf import settings
+from django.core.cache import cache
 
 from fuel.models import Place
+from fuel.services import boundary
 from fuel.services.names import CANADIAN_PROVINCES, place_key
 
 EARTH_RADIUS_MI = 3958.7613
@@ -33,13 +42,17 @@ STATE_NAMES = {
 }
 STATE_CODES = set(STATE_NAMES.values())
 
-# Rough bounding boxes: contiguous US, Alaska, Hawaii.
-_US_BOXES = [(24.3, 49.5, -125.0, -66.8), (51.0, 71.6, -180.0, -129.9), (18.8, 22.4, -160.5, -154.7)]
 _LATLON = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
 
 
 class LocationError(ValueError):
-    pass
+    status = 400
+
+
+class GeocoderUnavailable(LocationError):
+    """The external geocoder failed or the rate limit could not be honoured in time."""
+
+    status = 503
 
 
 @dataclass(frozen=True)
@@ -47,14 +60,14 @@ class Location:
     lat: float
     lon: float
     label: str
-    source: str  # "coordinates" | "local" | "nominatim"
+    source: str  # "coordinates" | "local" | "nominatim" | "nominatim-cache"
 
     def as_dict(self):
         return {"query_label": self.label, "lat": round(self.lat, 6), "lon": round(self.lon, 6), "resolved_by": self.source}
 
 
 def in_usa(lat: float, lon: float) -> bool:
-    return any(a <= lat <= b and c <= lon <= d for a, b, c, d in _US_BOXES)
+    return boundary.contains(lat, lon)
 
 
 def haversine_mi(lat1, lon1, lat2, lon2):
@@ -89,16 +102,21 @@ def _from_coordinates(query):
     return Location(lat, lon, query, "coordinates")
 
 
+_COUNTRY = {"USA", "US", "U.S.", "U.S.A.", "UNITED STATES", "UNITED STATES OF AMERICA"}
+
+
 def _from_local_places(query):
+    """Only plain "City, ST" input. Anything with more detail (a street, a
+    building) goes to the geocoder rather than being collapsed to a city centre."""
     parts = [p.strip() for p in query.split(",")]
-    if len(parts) < 2:
+    if len(parts) == 3 and parts[2].upper() in _COUNTRY:
+        parts = parts[:2]
+    if len(parts) != 2:
         return None
-    city, state = parts[-2], parts[-1].upper()
-    state = STATE_NAMES.get(state.lower(), state)
-    state = re.sub(r"\s+\d{5}(-\d{4})?$", "", state)  # "TX 75201"
-    if state == "USA" and len(parts) >= 3:
-        city, state = parts[-3], STATE_NAMES.get(parts[-2].lower(), parts[-2].upper())
-    if state not in STATE_CODES:
+    city, state = parts
+    state = re.sub(r"\s+\d{5}(-\d{4})?$", "", state.strip())  # "TX 75201"
+    state = STATE_NAMES.get(state.lower(), state.upper())
+    if state not in STATE_CODES or not city or any(ch.isdigit() for ch in city):
         return None
     place = Place.objects.filter(key=place_key(city, state)).order_by("rank").first()
     if not place:
@@ -106,7 +124,40 @@ def _from_local_places(query):
     return Location(place.lat, place.lon, f"{city}, {state}", "local")
 
 
+# -- Nominatim -----------------------------------------------------------------
+_rate_lock = threading.Lock()
+_RATE_KEY = "nominatim:slot"
+
+
+def _acquire_rate_slot():
+    """Wait for permission to make one Nominatim request (max 1 per second).
+
+    `cache.add` is atomic, so with a shared cache (Redis/Memcached) the limit
+    holds across all worker processes; with the default in-process cache it
+    holds per process. Gives up after GEOCODE_MAX_WAIT_SECONDS.
+    """
+    deadline = time.monotonic() + settings.GEOCODE_MAX_WAIT_SECONDS
+    with _rate_lock:
+        while not cache.add(_RATE_KEY, 1, timeout=1):
+            if time.monotonic() >= deadline:
+                raise GeocoderUnavailable("Geocoder is busy; please retry in a moment.")
+            time.sleep(0.05)
+
+
+def _cache_key(query):
+    normalized = re.sub(r"\s+", " ", query.lower()).strip()
+    return "geocode:" + hashlib.sha1(normalized.encode()).hexdigest()  # safe for any cache backend
+
+
 def _from_nominatim(query):
+    key = _cache_key(query)
+    hit = cache.get(key)
+    if hit is not None:
+        if not hit:
+            raise LocationError(f"Could not find '{query}' in the USA.")
+        return Location(hit["lat"], hit["lon"], hit["label"], "nominatim-cache")
+
+    _acquire_rate_slot()
     try:
         r = requests.get(
             settings.NOMINATIM_URL,
@@ -117,8 +168,10 @@ def _from_nominatim(query):
         r.raise_for_status()
         hits = r.json()
     except (requests.RequestException, ValueError) as exc:
-        raise LocationError(f"Could not geocode '{query}': {exc}") from exc
+        raise GeocoderUnavailable(f"Could not geocode '{query}': {exc}") from exc
     if not hits:
+        cache.set(key, {}, settings.GEOCODE_NEGATIVE_CACHE_SECONDS)
         raise LocationError(f"Could not find '{query}' in the USA.")
-    hit = hits[0]
-    return Location(float(hit["lat"]), float(hit["lon"]), hit.get("display_name", query), "nominatim")
+    best = {"lat": float(hits[0]["lat"]), "lon": float(hits[0]["lon"]), "label": hits[0].get("display_name", query)}
+    cache.set(key, best, settings.GEOCODE_CACHE_SECONDS)
+    return Location(best["lat"], best["lon"], best["label"], "nominatim")

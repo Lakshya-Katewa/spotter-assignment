@@ -1,5 +1,3 @@
-import json
-
 from django.shortcuts import render
 from django.urls import reverse
 from django.utils.http import urlencode
@@ -16,7 +14,11 @@ class RouteQuerySerializer(serializers.Serializer):
     geometry = serializers.BooleanField(required=False, default=True)
     min_stop_savings = serializers.FloatField(
         required=False, allow_null=True, default=None, min_value=0, max_value=1000,
-        help_text="Skip stops that save less than this many dollars; 0 = strictly cheapest plan.",
+        help_text="Skip stops that save less than this many dollars; 0 (default) = strictly cheapest plan.",
+    )
+    start_fuel_gallons = serializers.FloatField(
+        required=False, allow_null=True, default=None, min_value=0,
+        help_text="Fuel already in the tank at the start. Omit for 'nearly empty'.",
     )
 
 
@@ -44,13 +46,22 @@ class RoutePlanView(APIView):
                 finish,
                 include_geometry=q.validated_data["geometry"],
                 min_stop_savings=q.validated_data["min_stop_savings"],
+                start_fuel_gallons=q.validated_data["start_fuel_gallons"],
             )
         except PlanError as exc:
             return Response({"error": str(exc)}, status=exc.status)
         data["map_url"] = request.build_absolute_uri(
             reverse("route-map")
             + "?"
-            + urlencode({"start": start, "finish": finish, "min_stop_savings": data["meta"]["min_stop_savings"]})
+            + urlencode(
+                {
+                    "start": start,
+                    "finish": finish,
+                    "min_stop_savings": data["meta"]["min_stop_savings"],
+                    **({"start_fuel_gallons": q.validated_data["start_fuel_gallons"]}
+                       if q.validated_data["start_fuel_gallons"] is not None else {}),
+                }
+            )
         )
         return Response(data)
 
@@ -60,12 +71,20 @@ def route_map(request):
     start = request.GET.get("start", "").strip()
     finish = request.GET.get("finish", "").strip()
     savings = request.GET.get("min_stop_savings", "").strip()
-    ctx = {"start": start, "finish": finish, "min_stop_savings": savings, "plan": None, "error": None}
+    start_fuel = request.GET.get("start_fuel_gallons", "").strip()
+    ctx = {"start": start, "finish": finish, "min_stop_savings": savings, "start_fuel_gallons": start_fuel,
+           "plan": None, "error": None}
+    status = 200
     if start and finish:
         try:
-            value = float(savings) if savings else None
-            ctx["plan"] = build_plan(start, finish, min_stop_savings=value)
-        except ValueError as exc:  # PlanError is a ValueError too
-            ctx["error"] = str(exc) if isinstance(exc, PlanError) else "min_stop_savings must be a number."
-    ctx["plan_json"] = json.dumps(ctx["plan"]) if ctx["plan"] else "null"
-    return render(request, "fuel/map.html", ctx, status=400 if ctx["error"] else 200)
+            ctx["plan"] = build_plan(
+                start,
+                finish,
+                min_stop_savings=float(savings) if savings else None,
+                start_fuel_gallons=float(start_fuel) if start_fuel else None,
+            )
+        except PlanError as exc:
+            ctx["error"], status = str(exc), exc.status
+        except ValueError:
+            ctx["error"], status = "min_stop_savings and start_fuel_gallons must be numbers.", 400
+    return render(request, "fuel/map.html", ctx, status=status)

@@ -69,11 +69,11 @@
       }
     },
     {
-      "name": "Plan route (GET) - strictly cheapest plan",
+      "name": "Plan route (GET) - street address start",
       "request": {
         "method": "GET",
         "url": {
-          "raw": "{{base_url}}/api/route/?start=New York, NY&finish=Los Angeles, CA&min_stop_savings=0&geometry=false",
+          "raw": "{{base_url}}/api/route/?start=1600 Pennsylvania Ave NW, Washington, DC&finish=Boston, MA&geometry=false",
           "host": [
             "{{base_url}}"
           ],
@@ -85,15 +85,50 @@
           "query": [
             {
               "key": "start",
-              "value": "New York, NY"
+              "value": "1600 Pennsylvania Ave NW, Washington, DC"
             },
             {
               "key": "finish",
-              "value": "Los Angeles, CA"
+              "value": "Boston, MA"
+            },
+            {
+              "key": "geometry",
+              "value": "false"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Plan route (GET) - full tank at start, fewer stops",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/api/route/?start=Chicago, IL&finish=Dallas, TX&start_fuel_gallons=50&min_stop_savings=5&geometry=false",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "route",
+            ""
+          ],
+          "query": [
+            {
+              "key": "start",
+              "value": "Chicago, IL"
+            },
+            {
+              "key": "finish",
+              "value": "Dallas, TX"
+            },
+            {
+              "key": "start_fuel_gallons",
+              "value": "50"
             },
             {
               "key": "min_stop_savings",
-              "value": "0"
+              "value": "5"
             },
             {
               "key": "geometry",

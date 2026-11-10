@@ -36,3 +36,17 @@ class FuelStation(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.city}, {self.state}) ${self.price}"
+
+
+class DatasetVersion(models.Model):
+    """Single row, rewritten by `load_stations`. Workers compare it to the version of
+    their in-memory station index, and it is part of every plan cache key, so new
+    prices take effect on the next request without restarting anything."""
+
+    version = models.CharField(max_length=32)
+    loaded_at = models.DateTimeField(auto_now=True)
+    station_count = models.PositiveIntegerField(default=0)
+
+    @classmethod
+    def current(cls) -> str:
+        return cls.objects.filter(pk=1).values_list("version", flat=True).first() or "none"

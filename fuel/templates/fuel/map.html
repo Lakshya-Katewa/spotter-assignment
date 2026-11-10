@@ -43,7 +43,8 @@
     <form method="get">
       <label>Start <input name="start" value="{{ start }}" placeholder="e.g. Chicago, IL" required></label>
       <label>Finish <input name="finish" value="{{ finish }}" placeholder="e.g. Dallas, TX" required></label>
-      <label>Skip stops saving less than ($) <input name="min_stop_savings" value="{{ min_stop_savings }}" placeholder="5 (0 = cheapest possible)" inputmode="decimal"></label>
+      <label>Skip stops saving less than ($) <input name="min_stop_savings" value="{{ min_stop_savings }}" placeholder="0 = cheapest possible" inputmode="decimal"></label>
+      <label>Fuel in tank at start (gal) <input name="start_fuel_gallons" value="{{ start_fuel_gallons }}" placeholder="nearly empty if blank" inputmode="decimal"></label>
       <button type="submit">Plan route</button>
     </form>
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
@@ -51,7 +52,7 @@
       <div class="stats">
         <div class="stat total"><b>${{ plan.summary.total_fuel_cost|floatformat:2 }}</b><span>Total fuel cost</span></div>
         <div class="stat"><b>{{ plan.route.distance_miles|floatformat:0 }} mi</b><span>{{ plan.route.duration_hours|floatformat:1 }} h driving</span></div>
-        <div class="stat"><b>{{ plan.summary.total_gallons|floatformat:1 }} gal</b><span>at {{ plan.meta.assumptions.miles_per_gallon|floatformat:0 }} mpg</span></div>
+        <div class="stat"><b>{{ plan.summary.fuel_purchased_gallons|floatformat:1 }} gal</b><span>bought ({{ plan.summary.fuel_consumed_gallons|floatformat:1 }} used at {{ plan.meta.assumptions.miles_per_gallon|floatformat:0 }} mpg)</span></div>
         <div class="stat"><b>${{ plan.summary.average_price_per_gallon|floatformat:3 }}</b><span>Avg price / gal</span></div>
       </div>
       {% if plan.summary.extra_cost_for_fewer_stops > 0 %}
@@ -63,14 +64,14 @@
         {% for s in plan.fuel_stops %}
         <li data-stop="{{ forloop.counter0 }}">
           <span class="num">{{ s.stop }}</span>
-          <div><b>{{ s.name }}</b><div class="meta">{{ s.city }}, {{ s.state }} · mile {{ s.mile_marker|floatformat:0 }}</div>
+          <div><b>{{ s.name }}</b><div class="meta">{{ s.city }}, {{ s.state }} · mile {{ s.mile_marker|floatformat:0 }} · {{ s.access }}</div>
                <div class="meta">{{ s.address }}</div></div>
           <div class="right"><b>${{ s.cost|floatformat:2 }}</b><div class="meta">{{ s.gallons_purchased|floatformat:1 }} gal @ ${{ s.price_per_gallon|floatformat:3 }}</div></div>
         </li>
         {% endfor %}
       </ol>
-      <small class="note">Range {{ plan.meta.assumptions.max_range_miles|floatformat:0 }} mi, tank starts empty.
-        Station positions are city centroids. {% if plan.meta.cached %}Served from cache.{% endif %}
+      <small class="note">Estimate. Range {{ plan.meta.assumptions.max_range_miles|floatformat:0 }} mi; starting fuel: {{ plan.meta.assumptions.starting_fuel }}.
+        Station positions are city centroids, matched to the route by highway. {% if plan.meta.cached %}Served from cache.{% endif %}
         Computed in {{ plan.meta.elapsed_ms }} ms.</small>
     {% endif %}
   </aside>
@@ -78,8 +79,18 @@
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+{{ plan|json_script:"plan-data" }}
 <script>
-  const plan = {{ plan_json|safe }};
+  // Data arrives via json_script (escaped for <script>), and all text goes into
+  // the DOM as text nodes, never as HTML, so station names or geocoder labels
+  // can't inject markup.
+  const plan = JSON.parse(document.getElementById('plan-data').textContent);
+  const el = (tag, text) => { const e = document.createElement(tag); if (text != null) e.textContent = text; return e; };
+  const popup = (lines) => {
+    const box = el('div');
+    lines.forEach((line, i) => { if (i) box.append(el('br')); box.append(i === 0 ? el('b', line) : document.createTextNode(line)); });
+    return box;
+  };
   const map = L.map('map').setView([39.5, -98.35], 4);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 18, attribution: '&copy; OpenStreetMap contributors'
@@ -88,12 +99,17 @@
   if (plan) {
     const line = L.geoJSON(plan.route.geometry, { style: { color: '#0b6bcb', weight: 5, opacity: .8 } }).addTo(map);
     map.fitBounds(line.getBounds(), { padding: [30, 30] });
-    const pin = (text, cls = '') => L.divIcon({ className: '', html: `<div class="pin ${cls}">${text}</div>`, iconSize: [26, 26], iconAnchor: [13, 13] });
-    L.marker([plan.start.lat, plan.start.lon], { icon: pin('A', 'end') }).bindPopup('Start: ' + plan.start.query_label).addTo(map);
-    L.marker([plan.finish.lat, plan.finish.lon], { icon: pin('B', 'end') }).bindPopup('Finish: ' + plan.finish.query_label).addTo(map);
-    const markers = plan.fuel_stops.map(s => L.marker([s.lat, s.lon], { icon: pin(s.stop) })
-      .bindPopup(`<b>${s.stop}. ${s.name}</b><br>${s.address}<br>${s.city}, ${s.state}<br>` +
-                 `$${s.price_per_gallon.toFixed(3)}/gal · ${s.gallons_purchased.toFixed(1)} gal · <b>$${s.cost.toFixed(2)}</b>`)
+    const pin = (text, cls = '') => {
+      const d = el('div', String(text)); d.className = 'pin ' + cls;
+      return L.divIcon({ className: '', html: d, iconSize: [26, 26], iconAnchor: [13, 13] });
+    };
+    L.marker([plan.start.lat, plan.start.lon], { icon: pin('A', 'end') }).bindPopup(popup(['Start', plan.start.query_label])).addTo(map);
+    L.marker([plan.finish.lat, plan.finish.lon], { icon: pin('B', 'end') }).bindPopup(popup(['Finish', plan.finish.query_label])).addTo(map);
+    const markers = plan.fuel_stops.map(s => L.marker([s.lat, s.lon], { icon: pin(Number(s.stop)) })
+      .bindPopup(popup([
+        s.stop + '. ' + s.name, s.address, s.city + ', ' + s.state, s.access,
+        '$' + s.price_per_gallon.toFixed(3) + '/gal · ' + s.gallons_purchased.toFixed(1) + ' gal · $' + s.cost.toFixed(2),
+      ]))
       .addTo(map));
     document.querySelectorAll('li[data-stop]').forEach(li => li.addEventListener('click', () => {
       const m = markers[+li.dataset.stop]; map.setView(m.getLatLng(), 10); m.openPopup();
