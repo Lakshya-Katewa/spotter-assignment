@@ -1,0 +1,187 @@
+{
+  "info": {
+    "name": "Fuel Route Planner",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://127.0.0.1:8000"
+    }
+  ],
+  "item": [
+    {
+      "name": "Plan route (GET) - New York to Los Angeles",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/api/route/?start=New York, NY&finish=Los Angeles, CA",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "route",
+            ""
+          ],
+          "query": [
+            {
+              "key": "start",
+              "value": "New York, NY"
+            },
+            {
+              "key": "finish",
+              "value": "Los Angeles, CA"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Plan route (GET) - without geometry",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/api/route/?start=Chicago, IL&finish=Dallas, TX&geometry=false",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "route",
+            ""
+          ],
+          "query": [
+            {
+              "key": "start",
+              "value": "Chicago, IL"
+            },
+            {
+              "key": "finish",
+              "value": "Dallas, TX"
+            },
+            {
+              "key": "geometry",
+              "value": "false"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Plan route (GET) - strictly cheapest plan",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/api/route/?start=New York, NY&finish=Los Angeles, CA&min_stop_savings=0&geometry=false",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "route",
+            ""
+          ],
+          "query": [
+            {
+              "key": "start",
+              "value": "New York, NY"
+            },
+            {
+              "key": "finish",
+              "value": "Los Angeles, CA"
+            },
+            {
+              "key": "min_stop_savings",
+              "value": "0"
+            },
+            {
+              "key": "geometry",
+              "value": "false"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Plan route (POST) - coordinates",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"start\": \"47.6062,-122.3321\",\n  \"finish\": \"Miami, FL\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/route/",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "route",
+            ""
+          ]
+        }
+      }
+    },
+    {
+      "name": "Error - outside USA",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/api/route/?start=Toronto, ON&finish=Dallas, TX",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "route",
+            ""
+          ],
+          "query": [
+            {
+              "key": "start",
+              "value": "Toronto, ON"
+            },
+            {
+              "key": "finish",
+              "value": "Dallas, TX"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Map page (open in browser)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/map/?start=New York, NY&finish=Los Angeles, CA",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "map",
+            ""
+          ],
+          "query": [
+            {
+              "key": "start",
+              "value": "New York, NY"
+            },
+            {
+              "key": "finish",
+              "value": "Los Angeles, CA"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
