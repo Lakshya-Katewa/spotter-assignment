@@ -44,9 +44,10 @@ class ApiTests(ApiFixture):
         for stop in data["fuel_stops"]:
             self.assertLessEqual(stop["fuel_on_arrival_gallons"] + stop["gallons_purchased"], TANK + 0.01)
         self.assertTrue(s["is_estimate"])
-        # Default: start empty and pay for every gallon; the ~3.5 mi to the first station
+        # Default: pay for every gallon; the ~3.5 mi to the first station
         # are billed at its price.
         self.assertTrue(s["starting_fuel_billed"])
+        self.assertEqual(data["meta"]["warnings"], [])
         self.assertAlmostEqual(s["fuel_paid_for_gallons"], s["fuel_consumed_gallons"], places=1)
         self.assertAlmostEqual(s["starting_fuel_cost"], s["starting_fuel_gallons"] * stops["START STOP"]["price_per_gallon"], places=2)
         self.assertAlmostEqual(s["total_fuel_cost"], s["starting_fuel_cost"] + sum(x["cost"] for x in data["fuel_stops"]), places=1)
@@ -263,6 +264,18 @@ class CoverageGapTests(ApiFixture):
         self.assertEqual(r.status_code, 200, r.content)
         self.assertEqual(r.json()["fuel_stops"], [])
         self.assertEqual(r.json()["summary"]["total_fuel_cost"], 0)
+
+
+class FarFirstStationTests(ApiFixture):
+    @override_settings(START_APPROACH_MILES=1)
+    @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
+    def test_first_station_beyond_approach_is_flagged(self, _):
+        # The first station is ~3.5 miles out, beyond the 1-mile approach: still a plan, with a warning.
+        r = self.get()
+        self.assertEqual(r.status_code, 200, r.content)
+        warnings = r.json()["meta"]["warnings"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("assumed to start with", warnings[0])
 
 
 class HealthTests(ApiFixture):

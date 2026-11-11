@@ -206,6 +206,7 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, index) -> dict:
             }
         )
 
+    warnings = []
     billed_start = start_fuel_gallons is None
     paid_gallons = plan.total_gallons + (plan.start_fuel_gallons if billed_start else 0.0)
     avg = plan.total_cost / paid_gallons if paid_gallons else 0.0
@@ -216,6 +217,13 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, index) -> dict:
             "first stop's price. Pass start_fuel_gallons for fuel already in the tank (not charged)."
         )
         cost_note = "all fuel the trip burns (distance / mpg), at the prices of the planned stops"
+        first_leg = plan.start_fuel_gallons * mpg
+        if first_leg > settings.START_APPROACH_MILES:
+            warnings.append(
+                f"The price file has no station within {settings.START_APPROACH_MILES:g} miles of the start; "
+                f"the first is at mile {first_leg:.0f}. The vehicle is assumed to start with "
+                f"{plan.start_fuel_gallons:.1f} gallons, charged at that station's price."
+            )
     else:
         start_mode = f"{start_fuel_gallons:g} gallons already in the tank (given by the caller; not paid for on this trip)"
         cost_note = "fuel purchased during the trip; the fuel already in the tank at the start is not included"
@@ -258,6 +266,7 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, index) -> dict:
                     "feasibility are estimates (city-centre stops more so)."
                 ),
             },
+            "warnings": warnings,
             "min_stop_savings": min_stop_savings,
             "station_dataset_version": index.version,
             "routing_provider": settings.OSRM_URL,

@@ -43,7 +43,7 @@ class OptimizerTests(SimpleTestCase):
         with self.assertRaises(NoFeasiblePlan):
             plan_fuel_stops([("a", 50, 3.0)], total_miles=900, max_range_miles=500, mpg=10, start_fuel_gallons=3)
 
-    def test_empty_start_bills_fuel_to_first_station(self):
+    def test_pay_all_fuel_bills_fuel_to_first_station(self):
         plan = plan_fuel_stops([("a", 20, 3.0), ("b", 300, 2.0)], total_miles=600, max_range_miles=500, mpg=10, approach_miles=25)
         self.assertAlmostEqual(plan.start_fuel_gallons, 2)
         self.assertAlmostEqual(plan.start_fuel_cost, 6.0)  # 2 gal at a's $3.00
@@ -51,12 +51,12 @@ class OptimizerTests(SimpleTestCase):
         self.assertAlmostEqual(plan.total_cost, 6.0 + 28 * 3.0 + 30 * 2.0)
         assert_feasible(self, plan, 600)
 
-    def test_empty_start_short_trip_still_buys(self):
+    def test_pay_all_fuel_short_trip_still_buys(self):
         plan = plan_fuel_stops([("a", 0, 3.0)], total_miles=100, max_range_miles=500, mpg=10)
         self.assertEqual([s.key for s in plan.stops], ["a"])
         self.assertAlmostEqual(plan.total_cost, 30.0)
 
-    def test_empty_start_skips_pricey_stations_near_the_start(self):
+    def test_pay_all_fuel_skips_pricey_stations_near_the_start(self):
         # Regression: pinning the first stop to the first station on the route gave a chain
         # of tiny top-ups (mile 0 at $3.57, then 0.1 gal at mile 12, ...).
         stations = [("pricey", 0, 3.6), ("mid", 12, 3.4), ("cheap", 25, 3.0), ("far", 400, 3.1)]
@@ -69,25 +69,32 @@ class OptimizerTests(SimpleTestCase):
         plan = plan_fuel_stops(stations, total_miles=800, max_range_miles=500, mpg=10, approach_miles=5)
         self.assertEqual(plan.stops[0].key, "pricey")
 
-    def test_empty_start_never_invents_a_long_approach(self):
-        # Regression: the first station 450 miles out was "reached" on 45 billed gallons.
+    def test_pay_all_fuel_far_first_station(self):
+        # No station within the approach distance (Houston in the price file): the first
+        # station on the route is the first stop, reached on billed starting fuel.
+        plan = plan_fuel_stops([("far", 106, 3.0), ("next", 400, 2.9)], total_miles=900, max_range_miles=500, mpg=10)
+        self.assertEqual(plan.stops[0].key, "far")
+        self.assertAlmostEqual(plan.start_fuel_gallons, 10.6)
+        self.assertAlmostEqual(plan.start_fuel_cost, 10.6 * 3.0)
+        assert_feasible(self, plan, 900)
+        # Never more than a full tank's worth.
         with self.assertRaises(NoFeasiblePlan) as ctx:
-            plan_fuel_stops([("far", 450, 3.0)], total_miles=900, max_range_miles=500, mpg=10)
+            plan_fuel_stops([("far", 550, 3.0)], total_miles=900, max_range_miles=500, mpg=10)
         self.assertEqual(ctx.exception.code, "no_station_near_start")
         with self.assertRaises(NoFeasiblePlan) as ctx:
             plan_fuel_stops([], total_miles=300, max_range_miles=500, mpg=10)
         self.assertEqual(ctx.exception.code, "no_stations_on_route")
 
-    def test_empty_start_station_only_at_destination(self):
+    def test_pay_all_fuel_station_only_at_destination(self):
         with self.assertRaises(NoFeasiblePlan):
             plan_fuel_stops([("end", 100, 3.0)], total_miles=100, max_range_miles=500, mpg=10)
 
-    def test_empty_start_without_stations(self):
+    def test_pay_all_fuel_without_stations(self):
         with self.assertRaises(NoFeasiblePlan) as ctx:
             plan_fuel_stops([], total_miles=300, max_range_miles=500, mpg=10)
         self.assertIn("no fuel station along this route", str(ctx.exception))
 
-    def test_empty_start_matches_brute_force(self):
+    def test_pay_all_fuel_matches_brute_force(self):
         rnd, checked = random.Random(11), 0
         for _ in range(150):
             total = rnd.randint(50, 400)
@@ -98,10 +105,10 @@ class OptimizerTests(SimpleTestCase):
             except NoFeasiblePlan:
                 continue
             # Model: pick any first station before the destination within the approach
-            # distance, and pay for the drive there at its price.
+            # distance (or the first one on the route), and pay for the drive there at its price.
             miles = sorted({m for _, m, _ in stations if m < total})
             options = []
-            for m in (m for m in miles if m <= approach):
+            for m in (m for m in miles if m <= max(approach, miles[0])):
                 price = min(p for _, mm, p in stations if mm == m)
                 try:
                     rest = brute_force_cost([s for s in stations if s[1] >= m], total, 100, 10, m)

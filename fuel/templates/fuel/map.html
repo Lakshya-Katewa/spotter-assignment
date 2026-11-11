@@ -64,6 +64,7 @@
       <p class="meta">Cheapest plan shown. Skipping stops that save under ${{ alt.min_stop_savings|floatformat:0 }}:
         <a href="?start={{ start|urlencode }}&amp;finish={{ finish|urlencode }}&amp;min_stop_savings={{ alt.min_stop_savings }}{% if start_fuel_gallons %}&amp;start_fuel_gallons={{ start_fuel_gallons|urlencode }}{% endif %}">{{ alt.number_of_stops }} stops for ${{ alt.extra_cost|floatformat:2 }} more</a>.</p>
       {% endif %}{% endwith %}
+      {% for w in plan.meta.warnings %}<div class="error">{{ w }}</div>{% endfor %}
       {% if plan.summary.starting_fuel_billed and plan.summary.starting_fuel_gallons > 0 %}
       <p class="meta">Includes {{ plan.summary.starting_fuel_gallons|floatformat:1 }} gal to reach stop 1, billed at its price: ${{ plan.summary.starting_fuel_cost|floatformat:2 }}.</p>
       {% endif %}
