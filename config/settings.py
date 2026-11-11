@@ -169,10 +169,9 @@ STATION_NEAR_ROUTE_MILES = float(os.getenv("STATION_NEAR_ROUTE_MILES", "2"))
 # Stations placed at their interstate exit (exact position) must be this close to the route.
 # The route is sampled every mile, so ~0.5 mi of this is sampling error.
 EXIT_NEAR_ROUTE_MILES = float(os.getenv("EXIT_NEAR_ROUTE_MILES", "1"))
-# Fuel in the tank at the start unless the caller passes start_fuel_gallons.
-# Fixed (not derived from the plan) so costs of different plans are comparable.
-# 3 gallons = 30 miles: enough to reach a station near the start.
-DEFAULT_START_FUEL_GALLONS = float(os.getenv("DEFAULT_START_FUEL_GALLONS", "3"))
+# Empty start (the default): the first purchase may be at any station within this many
+# route miles of the start; the drive there is billed at that station's price.
+START_APPROACH_MILES = float(os.getenv("START_APPROACH_MILES", "30"))
 # Skip a fuel stop when it saves less than this many dollars (0 = strictly cheapest plan).
 MIN_STOP_SAVINGS = float(os.getenv("MIN_STOP_SAVINGS", "0"))
 # Threshold for the "fewer_stops_alternative" shown alongside the cheapest plan.

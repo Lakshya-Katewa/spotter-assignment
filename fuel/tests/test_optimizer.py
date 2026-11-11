@@ -43,6 +43,68 @@ class OptimizerTests(SimpleTestCase):
         with self.assertRaises(NoFeasiblePlan):
             plan_fuel_stops([("a", 50, 3.0)], total_miles=900, max_range_miles=500, mpg=10, start_fuel_gallons=3)
 
+    def test_empty_start_bills_fuel_to_first_station(self):
+        plan = plan_fuel_stops([("a", 20, 3.0), ("b", 300, 2.0)], total_miles=600, max_range_miles=500, mpg=10, approach_miles=0)
+        self.assertAlmostEqual(plan.start_fuel_gallons, 2)
+        self.assertAlmostEqual(plan.start_fuel_cost, 6.0)  # 2 gal at a's $3.00
+        self.assertAlmostEqual(plan.start_fuel_gallons + plan.total_gallons, 60)  # every gallon burned is paid for
+        self.assertAlmostEqual(plan.total_cost, 6.0 + 28 * 3.0 + 30 * 2.0)
+        assert_feasible(self, plan, 600)
+
+    def test_empty_start_short_trip_still_buys(self):
+        plan = plan_fuel_stops([("a", 0, 3.0)], total_miles=100, max_range_miles=500, mpg=10)
+        self.assertEqual([s.key for s in plan.stops], ["a"])
+        self.assertAlmostEqual(plan.total_cost, 30.0)
+
+    def test_empty_start_skips_pricey_stations_near_the_start(self):
+        # Regression: pinning the first stop to the first station on the route gave a chain
+        # of tiny top-ups (mile 0 at $3.57, then 0.1 gal at mile 12, ...).
+        stations = [("pricey", 0, 3.6), ("mid", 12, 3.4), ("cheap", 25, 3.0), ("far", 400, 3.1)]
+        plan = plan_fuel_stops(stations, total_miles=800, max_range_miles=500, mpg=10)
+        self.assertEqual(plan.stops[0].key, "cheap")
+        self.assertAlmostEqual(plan.start_fuel_gallons, 2.5)
+        self.assertAlmostEqual(plan.start_fuel_cost, 2.5 * 3.0)
+        self.assertNotIn("pricey", [s.key for s in plan.stops])
+        assert_feasible(self, plan, 800)
+        # Beyond the approach distance the first station on the route is used.
+        plan = plan_fuel_stops(stations, total_miles=800, max_range_miles=500, mpg=10, approach_miles=5)
+        self.assertEqual(plan.stops[0].key, "pricey")
+
+    def test_empty_start_station_only_at_destination(self):
+        with self.assertRaises(NoFeasiblePlan):
+            plan_fuel_stops([("end", 100, 3.0)], total_miles=100, max_range_miles=500, mpg=10)
+
+    def test_empty_start_without_stations(self):
+        with self.assertRaises(NoFeasiblePlan) as ctx:
+            plan_fuel_stops([], total_miles=300, max_range_miles=500, mpg=10)
+        self.assertIn("no fuel station along this route", str(ctx.exception))
+        with self.assertRaises(NoFeasiblePlan):
+            plan_fuel_stops([("a", 600, 3.0)], total_miles=900, max_range_miles=500, mpg=10)
+
+    def test_empty_start_matches_brute_force(self):
+        rnd = random.Random(11)
+        for _ in range(150):
+            total = rnd.randint(50, 400)
+            stations = [(k, rnd.randint(0, total), round(rnd.uniform(2.5, 4.5), 2)) for k in range(rnd.randint(1, 9))]
+            approach = rnd.choice((0, 15, 30))
+            try:
+                plan = plan_fuel_stops(stations, total_miles=total, max_range_miles=100, mpg=10, approach_miles=approach)
+            except NoFeasiblePlan:
+                continue
+            # Model: pick any first station before the destination within the approach
+            # distance (or the first one on the route), pay for the drive there at its price.
+            miles = sorted({m for _, m, _ in stations if m < total})
+            options = []
+            for m in (m for m in miles if m <= max(approach, miles[0])):
+                price = min(p for _, mm, p in stations if mm == m)
+                try:
+                    rest = brute_force_cost([s for s in stations if s[1] >= m], total, 100, 10, m)
+                except ValueError:
+                    continue
+                options.append(m / 10 * price + rest)
+            self.assertAlmostEqual(plan.total_cost, min(options), places=6)
+            assert_feasible(self, plan, total, tank=10)
+
     def test_zero_distance_trip_needs_no_stations(self):
         for start in (0, 3):
             plan = plan_fuel_stops([], total_miles=0, max_range_miles=500, mpg=10, start_fuel_gallons=start)
@@ -97,7 +159,7 @@ class OptimizerTests(SimpleTestCase):
             stations = [("s0", 0, round(rnd.uniform(2.5, 4.0), 2))]
             stations += [(f"s{k}", rnd.randint(1, total - 1), round(rnd.uniform(2.5, 4.0), 2)) for k in range(1, 8)]
             try:
-                plan = plan_fuel_stops(stations, total_miles=total, max_range_miles=100, mpg=10)
+                plan = plan_fuel_stops(stations, total_miles=total, max_range_miles=100, mpg=10, approach_miles=0)
             except NoFeasiblePlan:
                 continue
             self.assertAlmostEqual(plan.total_cost, brute_force_cost(stations, total, 100, 10, 0), places=6)

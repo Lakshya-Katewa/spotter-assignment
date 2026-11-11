@@ -112,7 +112,7 @@ def fake_route(*_args, **_kwargs):
 
 
 
-@override_settings(DEFAULT_START_FUEL_GALLONS=3, STATION_CORRIDOR_MILES=15, STATION_NEAR_ROUTE_MILES=2, MIN_STOP_SAVINGS=0)
+@override_settings(STATION_CORRIDOR_MILES=15, STATION_NEAR_ROUTE_MILES=2, MIN_STOP_SAVINGS=0)
 class ApiFixture(TestCase):
     """Shared stations along a fake north-south "I-99" route."""
 

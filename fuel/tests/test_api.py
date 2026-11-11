@@ -44,7 +44,13 @@ class ApiTests(ApiFixture):
         for stop in data["fuel_stops"]:
             self.assertLessEqual(stop["fuel_on_arrival_gallons"] + stop["gallons_purchased"], TANK + 0.01)
         self.assertTrue(s["is_estimate"])
-        self.assertEqual(s["starting_fuel_gallons"], 3)  # fixed default
+        # Default: start empty and pay for every gallon; the ~3.5 mi to the first station
+        # are billed at its price.
+        self.assertTrue(s["starting_fuel_billed"])
+        self.assertEqual(data["meta"]["warnings"], [])
+        self.assertAlmostEqual(s["fuel_paid_for_gallons"], s["fuel_consumed_gallons"], places=1)
+        self.assertAlmostEqual(s["starting_fuel_cost"], s["starting_fuel_gallons"] * stops["START STOP"]["price_per_gallon"], places=2)
+        self.assertAlmostEqual(s["total_fuel_cost"], s["starting_fuel_cost"] + sum(x["cost"] for x in data["fuel_stops"]), places=1)
         self.assertIn("not verified", data["meta"]["assumptions"]["station_location"])
         self.assertEqual(data["meta"]["external_calls"], {"routing": 1, "geocoding": 0})
 
@@ -63,6 +69,8 @@ class ApiTests(ApiFixture):
     def test_start_fuel_param(self, _):
         s = self.get(start_fuel_gallons=50).json()["summary"]
         self.assertEqual(s["starting_fuel_gallons"], 50)
+        self.assertFalse(s["starting_fuel_billed"])
+        self.assertEqual(s["starting_fuel_cost"], 0)
         self.assertAlmostEqual(s["fuel_purchased_gallons"], 69.1 - 50, places=1)
         self.assertEqual(self.get(start_fuel_gallons=51).status_code, 400)
         self.assertEqual(self.get(start_fuel_gallons=-1).status_code, 400)

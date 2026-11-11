@@ -35,10 +35,8 @@ def build_plan(
     if not math.isfinite(min_stop_savings) or min_stop_savings < 0:
         raise PlanError("min_stop_savings must be a number >= 0.")
     tank = settings.VEHICLE_MAX_RANGE_MILES / settings.VEHICLE_MPG
-    start_given = start_fuel_gallons is not None
-    if not start_given:
-        start_fuel_gallons = settings.DEFAULT_START_FUEL_GALLONS
-    if not (math.isfinite(start_fuel_gallons) and 0 <= start_fuel_gallons <= tank):
+    # None = start empty and pay for all the fuel the trip burns (see plan_fuel_stops).
+    if start_fuel_gallons is not None and not (math.isfinite(start_fuel_gallons) and 0 <= start_fuel_gallons <= tank):
         raise PlanError(f"start_fuel_gallons must be between 0 and {tank:g}.")
 
     try:
@@ -50,12 +48,12 @@ def build_plan(
         index = get_index()  # one consistent snapshot for the whole request
     except DatasetChanging as exc:
         raise PlanError(str(exc), 503) from exc
-    key_src = f"{index.version}|{a.lat:.5f},{a.lon:.5f}|{b.lat:.5f},{b.lon:.5f}|{min_stop_savings:g}|{start_fuel_gallons}"
+    key_src = f"v2|{index.version}|{a.lat:.5f},{a.lon:.5f}|{b.lat:.5f},{b.lon:.5f}|{min_stop_savings:g}|{start_fuel_gallons}|{settings.START_APPROACH_MILES:g}"
     cache_key = "plan:" + hashlib.sha1(key_src.encode()).hexdigest()
     result = cache.get(cache_key)
     cached = result is not None
     if not cached:
-        result = _compute(a, b, min_stop_savings, start_fuel_gallons, start_given, index)
+        result = _compute(a, b, min_stop_savings, start_fuel_gallons, index)
         cache.set(cache_key, result, settings.ROUTE_CACHE_SECONDS)
 
     out = dict(result)
@@ -99,7 +97,7 @@ def _route_match(c, info, route_highways, near_route, exit_near_route, window):
     return None
 
 
-def _compute(a, b, min_stop_savings, start_fuel_gallons, start_given, index) -> dict:
+def _compute(a, b, min_stop_savings, start_fuel_gallons, index) -> dict:
     try:
         route = routing.get_route(a.lat, a.lon, b.lat, b.lon)
     except routing.RoutingError as exc:
@@ -132,9 +130,15 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, start_given, index) -> 
             max_range_miles=max_range,
             mpg=mpg,
             start_fuel_gallons=start_fuel_gallons,
+            approach_miles=settings.START_APPROACH_MILES,
         )
     except NoFeasiblePlan as exc:
-        hint = "" if start_given else " Pass start_fuel_gallons if the vehicle starts with more fuel."
+        hint = ""
+        if start_fuel_gallons is None and exc.gap_start_mile == 0:
+            hint = (
+                " If the vehicle departs with fuel in the tank, pass start_fuel_gallons "
+                f"(up to {tank:g}; a full tank covers {max_range:g} miles)."
+            )
         raise PlanError(str(exc) + hint, 422) from exc
     plan = consolidate_stops(copy.deepcopy(cheapest), mpg, tank, min_stop_savings)
     # The cheapest plan often includes tiny top-ups (cents of savings each). Report what
@@ -176,12 +180,27 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, start_given, index) -> 
             }
         )
 
-    avg = plan.total_cost / plan.total_gallons if plan.total_gallons else 0.0
-    start_mode = (
-        f"{start_fuel_gallons:g} gallons (given by the caller)"
-        if start_given
-        else f"{start_fuel_gallons:g} gallons (default; pass start_fuel_gallons to change)"
-    )
+    warnings = []
+    billed_start = start_fuel_gallons is None
+    paid_gallons = plan.total_gallons + (plan.start_fuel_gallons if billed_start else 0.0)
+    avg = plan.total_cost / paid_gallons if paid_gallons else 0.0
+    if billed_start:
+        start_mode = (
+            "empty (default): every gallon the trip burns is paid for. The fuel to reach the first "
+            "station on the route is billed at that station's price. Pass start_fuel_gallons for "
+            "fuel already in the tank."
+        )
+        cost_note = "all fuel the trip burns (distance / mpg), at the prices of the planned stops"
+        approach = plan.start_fuel_gallons * mpg
+        if approach > settings.START_APPROACH_MILES:
+            warnings.append(
+                f"The nearest station on the route is {approach:.0f} miles from the start; the fuel to "
+                "reach it is billed at its price, which is a rougher estimate than usual."
+            )
+    else:
+        start_mode = f"{start_fuel_gallons:g} gallons already in the tank (given by the caller; not paid for on this trip)"
+        cost_note = "fuel purchased during the trip; the fuel already in the tank at the start is not included"
+
     return {
         "route": {
             "distance_miles": round(route.distance_miles, 1),
@@ -194,9 +213,12 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, start_given, index) -> 
         "fuel_stops": stops,
         "summary": {
             "total_fuel_cost": round(plan.total_cost, 2),
+            "fuel_paid_for_gallons": round(paid_gallons, 2),
             "fuel_purchased_gallons": round(plan.total_gallons, 2),
             "fuel_consumed_gallons": round(route.distance_miles / mpg, 2),
             "starting_fuel_gallons": round(plan.start_fuel_gallons, 2),
+            "starting_fuel_billed": billed_start,
+            "starting_fuel_cost": round(plan.start_fuel_cost, 2),
             "fuel_left_at_arrival_gallons": round(plan.end_fuel_gallons, 2),
             "average_price_per_gallon": round(avg, 4),
             "number_of_stops": len(stops),
@@ -214,7 +236,7 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, start_given, index) -> 
                 "miles_per_gallon": mpg,
                 "tank_gallons": tank,
                 "starting_fuel": start_mode,
-                "total_fuel_cost": "money spent on fuel purchased during the trip; the starting fuel is not included",
+                "total_fuel_cost": cost_note,
                 "station_location": (
                     "The price file has no coordinates. Stations whose address names an interstate exit "
                     "are placed at that exit (OpenStreetMap) and used if within "
@@ -224,6 +246,7 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, start_given, index) -> 
                     "feasibility are estimates (city-centre stops more so)."
                 ),
             },
+            "warnings": warnings,
             "min_stop_savings": min_stop_savings,
             "station_dataset_version": index.version,
             "routing_provider": settings.OSRM_URL,

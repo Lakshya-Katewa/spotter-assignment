@@ -17,7 +17,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env            # optional, the defaults work as-is
 python manage.py migrate
-python manage.py load_stations  # first run downloads 2 Census files (~3 MB zipped); then ~3 s, no network
+python manage.py load_stations  # ~3 s, fully offline (all data ships in data/)
 python manage.py runserver
 ```
 
@@ -25,7 +25,7 @@ Then:
 
 - API: <http://127.0.0.1:8000/api/route/?start=New%20York,%20NY&finish=Los%20Angeles,%20CA>
 - Map: <http://127.0.0.1:8000/map/?start=New%20York,%20NY&finish=Los%20Angeles,%20CA>
-- Tests: `python manage.py test fuel` (83 tests in `fuel/tests/`, no network needed)
+- Tests: `python manage.py test fuel` (91 tests in `fuel/tests/`, no network needed)
 - Postman: import `postman_collection.json`
 
 ## API
@@ -35,7 +35,7 @@ Then:
 | Parameter | Description |
 |---|---|
 | `start`, `finish` | `"City, ST"` / `"City, State"` (resolved locally), `"lat,lon"`, or a street address (geocoded, see below) |
-| `start_fuel_gallons` | Fuel in the tank at the start (0–50). Default **3 gallons** (30 miles, enough to reach a station near the start). The default is fixed and does not depend on the plan, so costs are comparable. |
+| `start_fuel_gallons` | Fuel already in the tank at the start (0–50), not paid for on this trip. **Default: start empty and pay for every gallon** (see "Starting fuel" below). `50` = leave with a full tank. |
 | `min_stop_savings` | Default `0` (strictly cheapest plan). Set to e.g. `5` to skip stops that save less than $5. |
 | `geometry` | `false` to leave the route line out of the response |
 
@@ -54,13 +54,14 @@ Response (New York → Los Angeles, trimmed):
     "…"
   ],
   "summary": {
-    "total_fuel_cost": 850.07,
-    "fuel_purchased_gallons": 278.04, "fuel_consumed_gallons": 281.04,
-    "starting_fuel_gallons": 3.0, "fuel_left_at_arrival_gallons": 0.0,
-    "average_price_per_gallon": 3.0574, "number_of_stops": 16, "stops_located_at_exit": 14,
+    "total_fuel_cost": 859.79,
+    "fuel_paid_for_gallons": 281.04, "fuel_purchased_gallons": 280.15, "fuel_consumed_gallons": 281.04,
+    "starting_fuel_gallons": 0.88, "starting_fuel_billed": true, "starting_fuel_cost": 2.86,
+    "fuel_left_at_arrival_gallons": 0.0,
+    "average_price_per_gallon": 3.0594, "number_of_stops": 16, "stops_located_at_exit": 14,
     "stations_considered": 304,
-    "cheapest_possible_cost": 850.07, "cheapest_possible_stops": 16, "extra_cost_for_fewer_stops": 0.0,
-    "fewer_stops_alternative": {"min_stop_savings": 5.0, "number_of_stops": 9, "total_fuel_cost": 855.05, "extra_cost": 4.98},
+    "cheapest_possible_cost": 859.79, "cheapest_possible_stops": 16, "extra_cost_for_fewer_stops": 0.0,
+    "fewer_stops_alternative": {"min_stop_savings": 5.0, "number_of_stops": 9, "total_fuel_cost": 864.77, "extra_cost": 4.98},
     "is_estimate": true
   },
   "meta": {"cached": false, "external_calls": {"routing": 1, "geocoding": 0}, "elapsed_ms": 1416.8,
@@ -69,7 +70,7 @@ Response (New York → Los Angeles, trimmed):
 }
 ```
 
-- `total_fuel_cost` is the money spent on fuel **purchased during the trip**; the starting fuel is not included. Fuel adds up as `starting_fuel_gallons + fuel_purchased_gallons − fuel_left_at_arrival_gallons = fuel_consumed_gallons` (route miles ÷ 10), and `fuel_on_arrival_gallons + gallons_purchased` never exceeds the 50-gallon tank.
+- `total_fuel_cost` is the cost of **all the fuel the trip burns**: route miles ÷ 10 gallons (`fuel_paid_for_gallons` = `fuel_consumed_gallons`), at the prices of the planned stops. It is the stop costs plus `starting_fuel_cost`, the few miles driven to the first station billed at that station's price. If you pass `start_fuel_gallons`, that fuel is already in the tank and is not paid for. Either way `starting_fuel_gallons + fuel_purchased_gallons − fuel_left_at_arrival_gallons = fuel_consumed_gallons`, and `fuel_on_arrival_gallons + gallons_purchased` never exceeds the 50-gallon tank.
 - `location_precision` says where the station's position comes from: `"highway exit"` (its matched interstate exit, from OpenStreetMap; not the pump's exact position) or `"city centre"`. `route_match` gives the evidence that the station can be used from the route (see "Stations on the route" below).
 - `fewer_stops_alternative` shows what skipping stops that save under $5 would give, alongside the cheapest plan (NY→LA: 9 stops instead of 16 for $4.98 more). The map page links to it.
 
@@ -127,19 +128,19 @@ request ─► resolve start/finish ─► OSRM route (1 call, cached) ─► st
    - **Station at its city centre:** accepted if its address names an I-/US- highway the route drives within 15 miles of that point, or the centre is within 2 miles of the route. Being "near the route" alone is not evidence of access; a city 7 miles from I-80 whose station is on a state road is rejected.
 
    On the sample routes most chosen stops are exit-placed: NY→LA 14 of 16, Chicago→Dallas 4 of 7, Denver→Kansas City 6 of 6.
-5. **Optimizer.** This is the classic fixed-route "gas station problem". Starting fuel is a fixed input (3 gallons unless given), tracked through the whole trip and never billed as a purchase. A zero-mile trip returns no stops and $0. At each stop:
+5. **Optimizer.** This is the classic fixed-route "gas station problem". By default the vehicle starts empty. Its first purchase can be at any station within 30 route miles of the start (`START_APPROACH_MILES`), and the drive there is billed at that station's price. Each possible first station is tried with the greedy rule below, and the cheapest whole-trip plan wins (a handful of sub-millisecond runs). Always taking the very first station instead gives chains of 0.1-gallon top-ups at pricey stations near the start: 11 stops instead of 7 on Chicago → Dallas. If no station is that close, the first station on the route is used and `meta.warnings` says so. Fuel passed as `start_fuel_gallons` is tracked through the trip and not billed. A zero-mile trip returns no stops and $0. At each stop:
    - if a cheaper station (or the destination) is within range, buy only enough fuel to reach it;
    - otherwise fill up and go to the cheapest station in range.
 
-   This greedy rule gives the minimum cost on the line. Tests check it against a brute-force dynamic program, both with and without starting fuel.
+   This greedy rule gives the minimum cost on the line. Tests check it against a brute-force dynamic program, for the empty start and for given starting fuel.
 6. **Caching and updates.** Plan cache keys include the dataset version. Each worker rebuilds its snapshot when the version changes. It reads the version before and after the rows and retries if it moved, so a snapshot never mixes two loads. Reloaded prices take effect on the next request without restarting anything.
 7. **Optional fewer stops.** With `min_stop_savings > 0`, a second pass removes a stop by moving its purchase to the previous stop (if the tank has room) or the next one (if it is still reachable), while each removal costs less than that amount. The response always reports `cheapest_possible_cost`.
 
    | Route | Default (cheapest) | `min_stop_savings=5` |
    |---|---|---|
-   | Chicago → Dallas | 7 stops, $273.91 | 3 stops, $275.28 |
-   | New York → Los Angeles | 16 stops, $850.07 | 9 stops, $855.05 |
-   | Seattle → Miami | 21 stops, $1,016.11 | 9 stops, $1,023.18 |
+   | Chicago → Dallas | 7 stops, $283.14 | 3 stops, $284.52 |
+   | New York → Los Angeles | 16 stops, $859.79 | 9 stops, $864.77 |
+   | Seattle → Miami | 21 stops, $1,027.50 | 9 stops, $1,034.57 |
 
 ## Assumptions and limits
 
@@ -148,8 +149,13 @@ request ─► resolve start/finish ─► OSRM route (1 call, cached) ─► st
   - City-centre stations (53%) can be off by a few miles, and their highway match is evidence, not proof.
   - Neither kind verifies access direction (which side of a divided highway), so the 500-mile feasibility of a plan is an estimate too.
   - Exit matching uses the exit number near the city. A wrong match needs the correct exit to be missing from OpenStreetMap *and* a different interstate's exit with the same number to be the only one within 15 miles. That's possible but rare, and ambiguous cases are excluded.
-- **Starting fuel.** The default is 3 gallons (30 miles), the same for every plan. Pass `start_fuel_gallons` to change it.
-- **Data coverage.** The provided price file has only 8 stations in California (all in Imperial/Riverside County) and none in Hawaii, so many trips there can't be planned. For example, San Francisco → Los Angeles returns 422 on the default 3 gallons, and works with `start_fuel_gallons=50`. The error message says this. It's a limit of the input data, not the planner.
+- **Starting fuel: empty by default.** The assignment asks for "the total money spent on fuel" at 10 mpg, so by default every gallon the trip burns is paid for, and `total_fuel_cost` checks out as miles ÷ 10 × prices. The price file has no station exactly at the start, so the short drive to the first stop (within 30 miles) is billed at that stop's price. On the sample routes that is 0–3 gallons. Why not start with a free full tank, which many solutions assume:
+  - trips under 500 miles would cost $0 with no stops, so the API would never show where to fuel up for them;
+  - up to 500 miles of fuel (about $150) would be left out of the total, and how much depends on the trip;
+  - where to buy the first tank is part of what the optimizer should decide.
+
+  A truck that really does leave the yard fuelled can pass `start_fuel_gallons` (e.g. `50` for a full tank). That fuel isn't billed, and `total_fuel_cost` then covers only what is bought on the way.
+- **Data coverage.** The provided price file has only 8 stations in California (all in Imperial/Riverside County) and none in Hawaii, so many trips there can't be planned. For example, San Francisco → Los Angeles has no station anywhere along the route, so it returns 422 with a message saying so. With `start_fuel_gallons=50` it returns a plan with no stops. This is a limit of the input data, not the planner.
 - **Arrive empty.** The plan buys only the fuel the trip needs.
 - Only Interstate and US routes are matched; state-route names differ too much between OSM and the price file. About 15% of stations name no I-/US- route, and they are used only when within 2 miles of the route.
 - Exit locations cover the contiguous US (the price file has no Alaska or Hawaii stations).
@@ -193,6 +199,7 @@ fuel/views.py                   REST endpoint + map page
 fuel/templates/fuel/map.html    Leaflet map (data via json_script, text-only DOM)
 fuel/tests/                     optimizer, geometry, routing, upstream robustness, geocoding,
                                 exits, API and settings tests (shared fixtures in helpers.py)
+data/2024_Gaz_*.txt.gz          Census Gazetteer places + county subdivisions (public domain, 2.7 MB)
 data/geocode_overrides.json     coordinates for places missing from the Census files
 data/us_boundary.json           Census US boundary (built by build_us_boundary)
 data/exit_locations.json        station positions at interstate exits (built by build_exit_locations)

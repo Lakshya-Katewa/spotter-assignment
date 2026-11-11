@@ -44,15 +44,15 @@
       <label>Start <input name="start" value="{{ start }}" placeholder="e.g. Chicago, IL" required></label>
       <label>Finish <input name="finish" value="{{ finish }}" placeholder="e.g. Dallas, TX" required></label>
       <label>Skip stops saving less than ($) <input name="min_stop_savings" value="{{ min_stop_savings }}" placeholder="0 = cheapest possible" inputmode="decimal"></label>
-      <label>Fuel in tank at start (gal) <input name="start_fuel_gallons" value="{{ start_fuel_gallons }}" placeholder="3 if blank" inputmode="decimal"></label>
+      <label>Fuel in tank at start (gal) <input name="start_fuel_gallons" value="{{ start_fuel_gallons }}" placeholder="empty if blank" inputmode="decimal"></label>
       <button type="submit">Plan route</button>
     </form>
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
     {% if plan %}
       <div class="stats">
-        <div class="stat total"><b>${{ plan.summary.total_fuel_cost|floatformat:2 }}</b><span>Fuel bought on the trip</span></div>
+        <div class="stat total"><b>${{ plan.summary.total_fuel_cost|floatformat:2 }}</b><span>{% if plan.summary.starting_fuel_billed %}All fuel for the trip{% else %}Fuel bought on the trip{% endif %}</span></div>
         <div class="stat"><b>{{ plan.route.distance_miles|floatformat:0 }} mi</b><span>{{ plan.route.duration_hours|floatformat:1 }} h driving</span></div>
-        <div class="stat"><b>{{ plan.summary.fuel_purchased_gallons|floatformat:1 }} gal</b><span>bought ({{ plan.summary.fuel_consumed_gallons|floatformat:1 }} used at {{ plan.meta.assumptions.miles_per_gallon|floatformat:0 }} mpg)</span></div>
+        <div class="stat"><b>{{ plan.summary.fuel_paid_for_gallons|floatformat:1 }} gal</b><span>paid for ({{ plan.summary.fuel_consumed_gallons|floatformat:1 }} used at {{ plan.meta.assumptions.miles_per_gallon|floatformat:0 }} mpg)</span></div>
         <div class="stat"><b>${{ plan.summary.average_price_per_gallon|floatformat:3 }}</b><span>Avg price / gal</span></div>
       </div>
       {% if plan.summary.extra_cost_for_fewer_stops > 0 %}
@@ -64,6 +64,9 @@
       <p class="meta">Cheapest plan shown. Skipping stops that save under ${{ alt.min_stop_savings|floatformat:0 }}:
         <a href="?start={{ start|urlencode }}&amp;finish={{ finish|urlencode }}&amp;min_stop_savings={{ alt.min_stop_savings }}{% if start_fuel_gallons %}&amp;start_fuel_gallons={{ start_fuel_gallons|urlencode }}{% endif %}">{{ alt.number_of_stops }} stops for ${{ alt.extra_cost|floatformat:2 }} more</a>.</p>
       {% endif %}{% endwith %}
+      {% if plan.summary.starting_fuel_billed and plan.summary.starting_fuel_gallons > 0 %}
+      <p class="meta">Includes {{ plan.summary.starting_fuel_gallons|floatformat:1 }} gal to reach stop 1, billed at its price: ${{ plan.summary.starting_fuel_cost|floatformat:2 }}.</p>
+      {% endif %}
       <ol>
         {% for s in plan.fuel_stops %}
         <li data-stop="{{ forloop.counter0 }}">

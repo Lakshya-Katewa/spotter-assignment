@@ -4,10 +4,13 @@ The price CSV has no coordinates, so each station is placed at the centroid of
 its city. Cities are matched against the Census Gazetteer place and county
 subdivision files. The few names that still don't match are geocoded once with
 Nominatim (`--geocode-missing`) and cached in data/geocode_overrides.json, so
-normal loads never touch the network.
+normal loads never touch the network. The Gazetteer files ship gzipped in data/
+(public domain), so a fresh checkout loads offline; they are downloaded from
+census.gov only if missing.
 """
 
 import csv
+import gzip
 import io
 import json
 import time
@@ -33,8 +36,14 @@ GAZETTEER_URL = "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2024_
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 
+def _gz(path: Path) -> Path:
+    return path.with_name(path.name + ".gz")
+
+
 def _read_gazetteer(path: Path):
-    with path.open(encoding="utf-8") as f:
+    if not path.exists():
+        path = _gz(path)
+    with (gzip.open(path, "rt", encoding="utf-8") if path.suffix == ".gz" else path.open(encoding="utf-8")) as f:
         reader = csv.reader(f, delimiter="\t")
         header = [h.strip() for h in next(reader)]
         for row in reader:
@@ -54,7 +63,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **opts):
         for path in (PLACES_FILE, COUSUBS_FILE):
-            if not path.exists():
+            if not path.exists() and not _gz(path).exists():
                 self._download_gazetteer(path)
         places = self._build_places()
         overrides = json.loads(OVERRIDES_FILE.read_text()) if OVERRIDES_FILE.exists() else {}

@@ -40,7 +40,7 @@ class RouteQuerySerializer(serializers.Serializer):
     )
     start_fuel_gallons = serializers.FloatField(
         required=False, allow_null=True, default=None, min_value=0,
-        help_text="Fuel in the tank at the start (gallons). Default: DEFAULT_START_FUEL_GALLONS (3).",
+        help_text="Fuel already in the tank at the start (gallons, not paid for). Default: start empty and pay for all fuel.",
     )
 
 
