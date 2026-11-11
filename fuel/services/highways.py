@@ -2,7 +2,7 @@
 
 Price-file addresses look like "I-44, EXIT 283 & US-69": the station sits at an
 exit of that highway. If the route drives that highway near the station's
-position, the station is reachable from the route without a real detour, even
+position, the station is likely reachable from the route with a short detour, even
 though we only know its city's centroid. Only Interstate and US routes are
 used; state-route naming differs too much between sources.
 """

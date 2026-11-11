@@ -60,18 +60,22 @@
         for ${{ plan.summary.extra_cost_for_fewer_stops|floatformat:2 }} more than the cheapest possible plan
         (${{ plan.summary.cheapest_possible_cost|floatformat:2 }}).</p>
       {% endif %}
+      {% with alt=plan.summary.fewer_stops_alternative %}{% if alt %}
+      <p class="meta">Cheapest plan shown. Skipping stops that save under ${{ alt.min_stop_savings|floatformat:0 }}:
+        <a href="?start={{ start|urlencode }}&amp;finish={{ finish|urlencode }}&amp;min_stop_savings={{ alt.min_stop_savings }}{% if start_fuel_gallons %}&amp;start_fuel_gallons={{ start_fuel_gallons|urlencode }}{% endif %}">{{ alt.number_of_stops }} stops for ${{ alt.extra_cost|floatformat:2 }} more</a>.</p>
+      {% endif %}{% endwith %}
       <ol>
         {% for s in plan.fuel_stops %}
         <li data-stop="{{ forloop.counter0 }}">
           <span class="num">{{ s.stop }}</span>
-          <div><b>{{ s.name }}</b><div class="meta">{{ s.city }}, {{ s.state }} · mile {{ s.mile_marker|floatformat:0 }} </div><div class="meta">{{ s.route_match }} (unverified)</div>
+          <div><b>{{ s.name }}</b><div class="meta">{{ s.city }}, {{ s.state }} · mile {{ s.mile_marker|floatformat:0 }} </div><div class="meta">{{ s.route_match }}{% if s.location_precision != "highway exit" %} (position estimated from city){% endif %}</div>
                <div class="meta">{{ s.address }}</div></div>
           <div class="right"><b>${{ s.cost|floatformat:2 }}</b><div class="meta">{{ s.gallons_purchased|floatformat:1 }} gal @ ${{ s.price_per_gallon|floatformat:3 }}</div></div>
         </li>
         {% endfor %}
       </ol>
       <small class="note">Estimate. Range {{ plan.meta.assumptions.max_range_miles|floatformat:0 }} mi; starting fuel: {{ plan.meta.assumptions.starting_fuel }}.
-        Station positions are city centroids, matched to the route by highway. {% if plan.meta.cached %}Served from cache.{% endif %}
+        {{ plan.summary.stops_located_at_exit }} of {{ plan.summary.number_of_stops }} stops are placed at their matched interstate exit (OpenStreetMap junction, not the pump's exact spot); the rest at their city centre. {% if plan.meta.cached %}Served from cache.{% endif %}
         Computed in {{ plan.meta.elapsed_ms }} ms.</small>
     {% endif %}
   </aside>
@@ -107,7 +111,7 @@
     L.marker([plan.finish.lat, plan.finish.lon], { icon: pin('B', 'end') }).bindPopup(popup(['Finish', plan.finish.query_label])).addTo(map);
     const markers = plan.fuel_stops.map(s => L.marker([s.lat, s.lon], { icon: pin(Number(s.stop)) })
       .bindPopup(popup([
-        s.stop + '. ' + s.name, s.address, s.city + ', ' + s.state, s.route_match + ' (unverified)',
+        s.stop + '. ' + s.name, s.address, s.city + ', ' + s.state, s.route_match + (s.location_precision === 'highway exit' ? '' : ' (position estimated from city)'),
         '$' + s.price_per_gallon.toFixed(3) + '/gal · ' + s.gallons_purchased.toFixed(1) + ' gal · $' + s.cost.toFixed(2),
       ]))
       .addTo(map));

@@ -24,6 +24,10 @@ class Place(models.Model):
         return f"{self.name}, {self.state}"
 
 
+LOCATION_EXIT = "exit"
+LOCATION_CITY = "city"
+
+
 class FuelStation(models.Model):
     opis_id = models.PositiveIntegerField(unique=True)
     name = models.CharField(max_length=255)
@@ -31,8 +35,15 @@ class FuelStation(models.Model):
     city = models.CharField(max_length=128)
     state = models.CharField(max_length=2)
     price = models.DecimalField(max_digits=7, decimal_places=4)
+    # Best known position: the highway exit (from OpenStreetMap) when the address
+    # names one we could match, otherwise the city centroid.
     lat = models.FloatField()
     lon = models.FloatField()
+    location_precision = models.CharField(max_length=8, default=LOCATION_CITY,
+                                          choices=[(LOCATION_EXIT, "highway exit"), (LOCATION_CITY, "city centre")])
+    exit_label = models.CharField(max_length=32, blank=True)  # e.g. "I-80 exit 27A"
+    city_lat = models.FloatField(default=0.0)  # Census centroid of the station's city (set by load_stations)
+    city_lon = models.FloatField(default=0.0)
 
     def __str__(self):
         return f"{self.name} ({self.city}, {self.state}) ${self.price}"

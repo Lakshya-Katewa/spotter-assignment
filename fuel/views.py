@@ -8,7 +8,6 @@ from rest_framework.views import APIView, exception_handler
 
 from fuel.services.planner import PlanError, build_plan
 
-
 RETRY_AFTER_SECONDS = "5"
 
 

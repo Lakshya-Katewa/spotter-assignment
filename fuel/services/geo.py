@@ -20,7 +20,6 @@ from dataclasses import dataclass
 
 import requests
 from django.conf import settings
-from django.core.cache import cache
 
 from fuel.models import Place
 from fuel.services import boundary, ratelimit, singleflight

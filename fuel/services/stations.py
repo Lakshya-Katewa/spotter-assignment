@@ -10,9 +10,8 @@ import threading
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.spatial import cKDTree
-
 from django.db import transaction
+from scipy.spatial import cKDTree
 
 from fuel.models import DatasetVersion, FuelStation
 from fuel.services import highways
@@ -47,7 +46,7 @@ class Candidate:
     highways: frozenset  # I-/US- highways named in the station's address
 
 
-FIELDS = ("opis_id", "lat", "lon", "price", "address", "name", "city", "state")
+FIELDS = ("opis_id", "lat", "lon", "price", "address", "name", "city", "state", "location_precision", "exit_label")
 
 
 @dataclass(frozen=True)
@@ -60,6 +59,8 @@ class StationInfo:
     lat: float
     lon: float
     price: float
+    location_precision: str  # "exit" (OSM interstate exit) or "city" (city centroid)
+    exit_label: str
 
 
 class StationIndex:
@@ -75,7 +76,8 @@ class StationIndex:
         self.highways = [highways.from_address(r[4]) for r in rows]
         self.info = {
             r[0]: StationInfo(opis_id=r[0], name=r[5], address=r[4], city=r[6], state=r[7],
-                              lat=float(r[1]), lon=float(r[2]), price=float(r[3]))
+                              lat=float(r[1]), lon=float(r[2]), price=float(r[3]),
+                              location_precision=r[8], exit_label=r[9])
             for r in rows
         }
         self.tree = cKDTree(_to_xyz(self.lat, self.lon)) if rows else None

@@ -76,14 +76,20 @@ def build_plan(
     return out
 
 
-def _route_match(c, route_highways, near_route, window):
-    """Evidence (not proof) that a station near the route can be used from it.
+def _route_match(c, info, route_highways, near_route, exit_near_route, window):
+    """Evidence that a station near the route can be used from it, or None to reject it.
 
-    * its address names a highway the route drives near that point (likely an exit
-      of the road we're on; exit, direction and detour are not verified); or
-    * its city centroid is within `near_route` miles of the route line.
-    Returns a description of the evidence, or None to reject the station.
+    * Station placed at its matched interstate exit (OSM junction): it must be within
+      `exit_near_route` miles of the route. Position-based, the strongest evidence we
+      have, though the pump itself may sit a short way from the junction.
+    * Station placed at its city centroid (no matchable exit): its address names a
+      highway the route uses nearby, or the centroid is within `near_route` miles.
+    Neither verifies access direction or the exact detour.
     """
+    if info.location_precision == "exit":
+        if c.offset_miles <= exit_near_route:
+            return f"matched to {info.exit_label}, {c.offset_miles:.1f} mi from the route"
+        return None
     if c.highways:
         shared = c.highways & highways.refs_near(route_highways, c.mile, window)
         if shared:
@@ -104,6 +110,7 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, start_given, index) -> 
     tank = max_range / mpg
     corridor = settings.STATION_CORRIDOR_MILES
     near_route = settings.STATION_NEAR_ROUTE_MILES
+    exit_near_route = settings.EXIT_NEAR_ROUTE_MILES
 
     # Scale geometry miles to the router's official distance so mile markers line up
     # with the step distances used for highway matching.
@@ -113,7 +120,7 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, start_given, index) -> 
     candidates, matches = [], {}
     for c in found:
         c.mile *= scale
-        how = _route_match(c, route.highways or [], near_route, corridor)
+        how = _route_match(c, index.info[c.station_id], route.highways or [], near_route, exit_near_route, corridor)
         if how:
             candidates.append(c)
             matches[c.station_id] = how
@@ -130,6 +137,19 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, start_given, index) -> 
         hint = "" if start_given else " Pass start_fuel_gallons if the vehicle starts with more fuel."
         raise PlanError(str(exc) + hint, 422) from exc
     plan = consolidate_stops(copy.deepcopy(cheapest), mpg, tank, min_stop_savings)
+    # The cheapest plan often includes tiny top-ups (cents of savings each). Report what
+    # a practical threshold would give, so the trade-off is visible without asking.
+    alt_threshold = settings.FEWER_STOPS_SUGGESTION_SAVINGS
+    alternative = None
+    if min_stop_savings < alt_threshold:
+        alt = consolidate_stops(copy.deepcopy(cheapest), mpg, tank, alt_threshold)
+        if len(alt.stops) < len(plan.stops):
+            alternative = {
+                "min_stop_savings": alt_threshold,
+                "number_of_stops": len(alt.stops),
+                "total_fuel_cost": round(alt.total_cost, 2),
+                "extra_cost": round(alt.total_cost - plan.total_cost, 2),
+            }
 
     offsets = {c.station_id: c.offset_miles for c in candidates}
     stops = []
@@ -147,8 +167,9 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, start_given, index) -> 
                 "lon": round(st.lon, 6),
                 "price_per_gallon": round(s.price, 4),
                 "mile_marker": round(s.mile, 1),
+                "location_precision": "highway exit" if st.location_precision == "exit" else "city centre",
                 "route_match": matches[s.key],
-                "city_centroid_distance_from_route_miles": round(offsets.get(s.key, 0.0), 1),
+                "distance_from_route_miles": round(offsets.get(s.key, 0.0), 1),
                 "fuel_on_arrival_gallons": round(s.fuel_on_arrival_gal, 2),
                 "gallons_purchased": round(s.gallons, 2),
                 "cost": round(s.cost, 2),
@@ -179,10 +200,12 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, start_given, index) -> 
             "fuel_left_at_arrival_gallons": round(plan.end_fuel_gallons, 2),
             "average_price_per_gallon": round(avg, 4),
             "number_of_stops": len(stops),
+            "stops_located_at_exit": sum(st["location_precision"] == "highway exit" for st in stops),
             "stations_considered": len(candidates),
             "cheapest_possible_cost": round(cheapest.total_cost, 2),
             "cheapest_possible_stops": len(cheapest.stops),
             "extra_cost_for_fewer_stops": round(plan.total_cost - cheapest.total_cost, 2),
+            "fewer_stops_alternative": alternative,
             "is_estimate": True,
         },
         "meta": {
@@ -193,11 +216,12 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, start_given, index) -> 
                 "starting_fuel": start_mode,
                 "total_fuel_cost": "money spent on fuel purchased during the trip; the starting fuel is not included",
                 "station_location": (
-                    "city centroid (the price file has no coordinates). A station is used if its address "
-                    "names a highway the route uses nearby, or its city is within "
-                    f"{near_route:g} miles of the route. This is evidence, not verification: the exact exit, "
-                    "access direction and detour are unknown, so mile markers, costs and range feasibility "
-                    "are estimates."
+                    "The price file has no coordinates. Stations whose address names an interstate exit "
+                    "are placed at that exit (OpenStreetMap) and used if within "
+                    f"{exit_near_route:g} mi of the route; the rest are placed at their city centroid and used "
+                    "if their address names a highway the route uses nearby, or the centroid is within "
+                    f"{near_route:g} mi. Access direction and detours are not verified, so costs and range "
+                    "feasibility are estimates (city-centre stops more so)."
                 ),
             },
             "min_stop_savings": min_stop_savings,

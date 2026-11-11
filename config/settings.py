@@ -23,11 +23,22 @@ load_dotenv(BASE_DIR / ".env")
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-dev-only-change-me')
-
-# SECURITY WARNING: don't run with debug turned on in production!
+# DEBUG defaults to on so reviewers can run this locally with no setup. With DEBUG off,
+# a real secret key is required and secure cookie/header settings are enabled.
 DEBUG = os.getenv('DJANGO_DEBUG', '1') == '1'
+
+_DEV_SECRET_KEY = 'django-insecure-dev-only-change-me'
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', _DEV_SECRET_KEY)
+if not DEBUG:
+    if SECRET_KEY == _DEV_SECRET_KEY:
+        from django.core.exceptions import ImproperlyConfigured
+
+        raise ImproperlyConfigured("Set DJANGO_SECRET_KEY when DJANGO_DEBUG=0.")
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_SSL_REDIRECT = os.getenv('DJANGO_SECURE_SSL_REDIRECT', '1') == '1'
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SECURE_HSTS_SECONDS = int(os.getenv('DJANGO_HSTS_SECONDS', '0'))  # opt in: HSTS is hard to undo
 
 ALLOWED_HOSTS = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,testserver').split(',')
 
@@ -127,11 +138,14 @@ STATIC_URL = 'static/'
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
-MAILERS = {
-    'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
-    },
-}
+# The app sends no email. Print to the console in development; outside DEBUG,
+# Django's default (SMTP) applies if email is ever configured.
+if DEBUG:
+    MAILERS = {
+        'default': {
+            'BACKEND': 'django.core.mail.backends.console.EmailBackend',
+        },
+    }
 
 
 # --- Fuel route planner -------------------------------------------------------
@@ -152,12 +166,17 @@ VEHICLE_MPG = float(os.getenv("VEHICLE_MPG", "10"))
 # centroid is within STATION_NEAR_ROUTE_MILES of the route.
 STATION_CORRIDOR_MILES = float(os.getenv("STATION_CORRIDOR_MILES", "15"))
 STATION_NEAR_ROUTE_MILES = float(os.getenv("STATION_NEAR_ROUTE_MILES", "2"))
+# Stations placed at their interstate exit (exact position) must be this close to the route.
+# The route is sampled every mile, so ~0.5 mi of this is sampling error.
+EXIT_NEAR_ROUTE_MILES = float(os.getenv("EXIT_NEAR_ROUTE_MILES", "1"))
 # Fuel in the tank at the start unless the caller passes start_fuel_gallons.
 # Fixed (not derived from the plan) so costs of different plans are comparable.
 # 3 gallons = 30 miles: enough to reach a station near the start.
 DEFAULT_START_FUEL_GALLONS = float(os.getenv("DEFAULT_START_FUEL_GALLONS", "3"))
 # Skip a fuel stop when it saves less than this many dollars (0 = strictly cheapest plan).
 MIN_STOP_SAVINGS = float(os.getenv("MIN_STOP_SAVINGS", "0"))
+# Threshold for the "fewer_stops_alternative" shown alongside the cheapest plan.
+FEWER_STOPS_SUGGESTION_SAVINGS = float(os.getenv("FEWER_STOPS_SUGGESTION_SAVINGS", "5"))
 ROUTE_CACHE_SECONDS = int(os.getenv("ROUTE_CACHE_SECONDS", str(24 * 3600)))
 
 # Default: in-process cache (zero setup; fine for one process). Set REDIS_URL to share the

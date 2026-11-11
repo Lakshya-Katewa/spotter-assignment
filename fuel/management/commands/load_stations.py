@@ -21,13 +21,14 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from fuel.models import DatasetVersion, FuelStation, Place
+from fuel.models import LOCATION_CITY, LOCATION_EXIT, DatasetVersion, FuelStation, Place
 from fuel.services.names import CANADIAN_PROVINCES, name_variants, place_key
 
 DATA = Path(settings.BASE_DIR) / "data"
 PLACES_FILE = DATA / "2024_Gaz_place_national.txt"
 COUSUBS_FILE = DATA / "2024_Gaz_cousubs_national.txt"
 OVERRIDES_FILE = DATA / "geocode_overrides.json"
+EXITS_FILE = DATA / "exit_locations.json"  # built by build_exit_locations
 GAZETTEER_URL = "https://www2.census.gov/geo/docs/maps-data/data/gazetteer/2024_Gazetteer/{name}.zip"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
@@ -70,13 +71,23 @@ class Command(BaseCommand):
         lookup = {k: tuple(v) for k, v in overrides.items() if v}
         lookup.update({k: (v[0], v[1]) for k, v in places.items()})
 
+        exit_locations = json.loads(EXITS_FILE.read_text())["stations"] if EXITS_FILE.exists() else {}
         objs, skipped = [], 0
         for s in stations.values():
             coords = lookup.get(place_key(s["city"], s["state"]))
             if not coords:
                 skipped += 1
                 continue
-            objs.append(FuelStation(**s, lat=coords[0], lon=coords[1]))
+            at_exit = exit_locations.get(str(s["opis_id"]))
+            objs.append(FuelStation(
+                **s,
+                city_lat=coords[0],
+                city_lon=coords[1],
+                lat=at_exit[0] if at_exit else coords[0],
+                lon=at_exit[1] if at_exit else coords[1],
+                location_precision=LOCATION_EXIT if at_exit else LOCATION_CITY,
+                exit_label=at_exit[2] if at_exit else "",
+            ))
 
         with transaction.atomic():
             FuelStation.objects.all().delete()
@@ -85,7 +96,10 @@ class Command(BaseCommand):
                 pk=1, defaults={"version": uuid.uuid4().hex, "station_count": len(objs)}
             )
 
-        self.stdout.write(self.style.SUCCESS(f"Loaded {len(objs)} stations ({skipped} skipped: city not geocoded)."))
+        at_exits = sum(o.location_precision == LOCATION_EXIT for o in objs)
+        self.stdout.write(self.style.SUCCESS(
+            f"Loaded {len(objs)} stations ({skipped} skipped: city not geocoded); "
+            f"{at_exits} placed at their matched interstate exit, the rest at their city centre."))
         if missing:
             self.stdout.write(f"Unmatched cities ({len(missing)}): {', '.join(missing[:30])}")
 
