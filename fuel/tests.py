@@ -843,3 +843,65 @@ class ApiHygieneTests(ApiFixture):
         finally:
             logger.setLevel(old)
         self.assertIn("OSRM request failed", logs.output[0])
+
+
+# -- review round 4: offshore Census points, polyline bounds, simplification -
+class OffshorePlaceTests(TestCase):
+    """Real US places whose Census internal point is not a usable location."""
+
+    @classmethod
+    def setUpTestData(cls):
+        # Actual Gazetteer internal points.
+        Place.objects.create(key=place_key("San Francisco", "CA"), name="San Francisco city", state="CA", lat=37.727239, lon=-123.032229)
+        Place.objects.create(key=place_key("Honolulu", "HI"), name="Honolulu CCD", state="HI", lat=27.793, lon=-175.848, rank=2)
+        Place.objects.create(key=place_key("Miami", "FL"), name="Miami city", state="FL", lat=25.775, lon=-80.209)
+
+    def setUp(self):
+        cache.clear()
+
+    @mock.patch("fuel.services.ratelimit.acquire")
+    @mock.patch("fuel.services.geo.requests.get")
+    def test_offshore_centroid_falls_back_to_geocoding_the_city(self, get, _):
+        cases = {"San Francisco, CA": (37.7793, -122.4193), "Honolulu, HI": (21.3069, -157.8583)}
+        for query, (lat, lon) in cases.items():
+            get.return_value = nominatim(lat, lon, query)
+            loc = resolve(query)
+            self.assertEqual(loc.source, "nominatim", query)
+            self.assertAlmostEqual(loc.lat, lat)
+            self.assertEqual(get.call_args.kwargs["params"]["q"], query)
+        self.assertEqual(resolve("San Francisco, CA").source, "nominatim-cache")  # one lookup per city
+
+    @mock.patch("fuel.services.geo.requests.get")
+    def test_onshore_centroid_stays_local(self, get):
+        self.assertEqual(resolve("Miami, FL").source, "local")
+        get.assert_not_called()
+
+    @mock.patch("fuel.services.ratelimit.acquire")
+    @mock.patch("fuel.services.geo.requests.get", side_effect=requests.ConnectionError("down"))
+    def test_fallback_outage_is_503_not_a_wrong_route(self, *_):
+        r = self.client.get("/api/route/", {"start": "San Francisco, CA", "finish": "Miami, FL"})
+        self.assertEqual(r.status_code, 503)
+
+
+class PolylineRobustnessTests(SimpleTestCase):
+    def test_oversized_value_is_rejected(self):
+        with self.assertRaises(ValueError):
+            decode("~" * 220 + "??")
+        with self.assertRaises(routing.RoutingError) as ctx:
+            routing.parse_osrm(200, {"code": "Ok", "routes": [{"distance": 1, "duration": 1, "geometry": "~" * 220 + "??"}]})
+        self.assertEqual(ctx.exception.status, 502)
+
+    def test_extreme_but_valid_values_still_decode(self):
+        line = [[-180.0, -90.0], [180.0, 90.0], [-180.0, -90.0]]
+        self.assertEqual(decode(encode(line)), line)
+
+    def test_simplify_keeps_backtracking_that_changes_the_drawn_line(self):
+        self.assertEqual(simplify([[0, 0], [-1, 0], [1, 0]]), [[0, 0], [-1, 0], [1, 0]])  # excursion behind the start
+        self.assertEqual(simplify([[0, 0], [4, 0], [3, 0]]), [[0, 0], [4, 0], [3, 0]])  # overshoot, then come back
+
+    def test_simplify_may_drop_backtracking_that_draws_identically(self):
+        # 0 -> 2 -> 1 -> 3 covers exactly the pixels of 0 -> 3; dropping it changes nothing on the map.
+        self.assertEqual(simplify([[0, 0], [2, 0], [1, 0], [3, 0]]), [[0, 0], [3, 0]])
+
+    def test_simplify_still_drops_redundant_points(self):
+        self.assertEqual(simplify([[0, 0], [1, 0.00001], [2, 0], [3, 0]]), [[0, 0], [3, 0]])

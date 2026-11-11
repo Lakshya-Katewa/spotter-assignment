@@ -7,7 +7,8 @@ Accepted inputs, tried in order:
   3. anything else (addresses)    -> Nominatim, restricted to the US. Results are
      cached, and calls are rate-limited to 1/second (Nominatim usage policy).
 
-Every result must fall inside the US national boundary (checked offline).
+Every result must fall inside the US national boundary (checked offline). For a
+local Census match whose internal point is offshore, the city is geocoded instead.
 """
 
 import hashlib
@@ -88,6 +89,12 @@ def resolve(query: str) -> Location:
         raise LocationError(f"'{query}' is outside the USA.")
 
     loc = _from_coordinates(query) or _from_local_places(query) or _from_nominatim(query)
+    if loc.source == "local" and not in_usa(loc.lat, loc.lon):
+        # A real US place whose Census internal point isn't a usable location: it is
+        # offshore (San Francisco includes the Farallon Islands) or far from the city
+        # ("Honolulu" matches Honolulu CCD, centred in the NW Hawaiian Islands).
+        # About 0.2% of names. Geocode the city instead (one cached lookup).
+        loc = _from_nominatim(query)
     if not in_usa(loc.lat, loc.lon):
         raise LocationError(f"'{query}' is outside the USA.")
     return loc
@@ -185,8 +192,9 @@ def _from_nominatim(query):
             key,
             lookup,
             ttl=lambda v: settings.GEOCODE_CACHE_SECONDS if v else settings.GEOCODE_NEGATIVE_CACHE_SECONDS,
-            lock_seconds=settings.EXTERNAL_TIMEOUT + settings.GEOCODE_MAX_WAIT_SECONDS,
-            wait_seconds=settings.GEOCODE_MAX_WAIT_SECONDS + settings.EXTERNAL_TIMEOUT,
+            # Leader's worst case: rate-limit wait + connect timeout + read timeout.
+            lock_seconds=settings.GEOCODE_MAX_WAIT_SECONDS + 2 * settings.EXTERNAL_TIMEOUT + 5,
+            wait_seconds=settings.GEOCODE_MAX_WAIT_SECONDS + 2 * settings.EXTERNAL_TIMEOUT + 5,
         )
     except singleflight.Busy:
         raise GeocoderUnavailable("Geocoder is busy; please retry in a moment.") from None

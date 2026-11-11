@@ -2,11 +2,16 @@
 
 import numpy as np
 
+# Each value is a delta of at most 360 degrees * 1e5 < 2**26, i.e. at most 6 five-bit
+# chunks. Allow 7; anything longer is malformed (and would otherwise grow without
+# bound and overflow float conversion).
+_MAX_CHUNKS = 7
+
 
 def decode(encoded: str, precision: int = 5) -> list:
     """Decode an encoded polyline to [[lon, lat], ...] (GeoJSON order).
 
-    Raises ValueError for truncated or invalid input.
+    Raises ValueError for truncated, invalid or oversized input.
     """
     if not isinstance(encoded, str):
         raise ValueError("polyline must be a string")
@@ -24,6 +29,8 @@ def decode(encoded: str, precision: int = 5) -> list:
                 if not 0 <= b < 64:
                     raise ValueError("invalid polyline character")
                 index += 1
+                if shift >= 5 * _MAX_CHUNKS:
+                    raise ValueError("polyline value too large")
                 result |= (b & 0x1F) << shift
                 shift += 5
                 if b < 0x20:
@@ -36,7 +43,11 @@ def decode(encoded: str, precision: int = 5) -> list:
 
 
 def simplify(coords, tolerance_deg: float = 0.0003) -> list:
-    """Douglas-Peucker in lon/lat degrees (0.0003 deg ~ 30 m): drops points that don't change the drawn line."""
+    """Douglas-Peucker in lon/lat degrees (0.0003 deg ~ 30 m): drops points that don't change the drawn line.
+
+    Distances are to the *segment* between the kept endpoints, not the infinite line
+    through them, so a section that doubles back (a U-turn or dead-end spur) is kept.
+    """
     pts = np.asarray(coords, dtype=float)
     n = len(pts)
     if n < 3:
@@ -50,11 +61,10 @@ def simplify(coords, tolerance_deg: float = 0.0003) -> list:
             continue
         seg = pts[e] - pts[s]
         rel = pts[s + 1 : e] - pts[s]
-        norm = np.hypot(*seg)
-        if norm == 0:
-            d = np.hypot(rel[:, 0], rel[:, 1])
-        else:
-            d = np.abs(seg[0] * rel[:, 1] - seg[1] * rel[:, 0]) / norm
+        seg_len2 = float(seg @ seg)
+        t = np.zeros(len(rel)) if seg_len2 == 0 else np.clip(rel @ seg / seg_len2, 0.0, 1.0)
+        nearest = np.outer(t, seg)  # closest point on the segment, relative to pts[s]
+        d = np.hypot(rel[:, 0] - nearest[:, 0], rel[:, 1] - nearest[:, 1])
         i = int(np.argmax(d))
         if d[i] > tolerance_deg:
             m = s + 1 + i

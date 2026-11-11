@@ -8,6 +8,12 @@ Two layers:
 After taking the locks the caller re-checks the cache, so whoever waited gets the
 leader's result instead of calling upstream again. If the leader dies, its cache
 lock expires (`lock_seconds`) and a waiter takes over.
+
+Guarantees: within one process, at most one compute() per key at a time, always.
+Across processes (shared cache), the same holds unless a leader runs longer than
+`lock_seconds`: the lock then expires and a waiter may start a second call. Callers
+size `lock_seconds` to their worst-case upstream time, but an upstream that keeps
+trickling bytes can outlast any fixed lock, so this is best-effort.
 """
 
 import threading

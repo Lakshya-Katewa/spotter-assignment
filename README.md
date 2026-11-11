@@ -10,6 +10,8 @@ Each new route makes **one** call to the routing API. Plain `"City, ST"` inputs 
 
 ## Quick start
 
+Requires **Python 3.12+** (Django 6.1's minimum; developed and tested on 3.14).
+
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -23,7 +25,7 @@ Then:
 
 - API: <http://127.0.0.1:8000/api/route/?start=New%20York,%20NY&finish=Los%20Angeles,%20CA>
 - Map: <http://127.0.0.1:8000/map/?start=New%20York,%20NY&finish=Los%20Angeles,%20CA>
-- Tests: `python manage.py test fuel` (62 tests, no network needed)
+- Tests: `python manage.py test fuel` (72 tests, no network needed)
 - Postman: import `postman_collection.json`
 
 ## API
@@ -104,11 +106,14 @@ request ─► resolve start/finish ─► OSRM route (1 call, cached) ─► st
      - Results, including misses, are cached for 30 days, and identical concurrent lookups share one request.
      - Requests are limited to one per second, as Nominatim's usage policy requires. The whole wait is bounded: if no slot frees up within 5 seconds, the request returns 503 rather than breaking the limit.
      - Every response field is validated; malformed data returns 502.
-   - Every location must fall inside the Census US national boundary (`data/us_boundary.json`, 5 m resolution, checked locally in about 0.1 ms). Windsor, Tijuana and Juárez are rejected; Detroit, San Ysidro and El Paso are accepted.
+   - Every location must fall inside the Census US national boundary (`data/us_boundary.json`, from the 1:5,000,000-scale cartographic file `cb_2024_us_nation_5m`, checked locally in about 0.1 ms). Windsor, Tijuana and Juárez are rejected; Detroit, San Ysidro and El Paso are accepted.
+   - A few real places (~0.2% of names) have a Census internal point that isn't a usable location. San Francisco's is offshore, because the city includes the Farallon Islands; "Honolulu" matches Honolulu CCD, centred in the Northwestern Hawaiian Islands. For these the city is geocoded instead: one cached Nominatim lookup.
 3. **Route.** One call to the public [OSRM](https://project-osrm.org/) server returns the full geometry (encoded polyline) and the route steps. The steps tell us which Interstate and US highways the route uses, and over which miles.
    - Routes are cached for 24 hours. The cache keeps the encoded polyline (~120 KB for a cross-country route), not decoded coordinates (~780 KB); decoding on use takes ~20 ms.
    - Calls are rate-limited to **1 per second**, as the demo server's usage policy requires (`fuel/services/ratelimit.py`, shared with Nominatim). Call starts are spaced at least 1.05 s apart. If no slot frees up within 5 seconds, the request returns 503 and the failure is not cached.
-   - **Concurrent requests for the same uncached route make one upstream call** (`fuel/services/singleflight.py`): a lock in this process plus a short cache lock, with the cache re-checked once the lock is held. Live test: 6 simultaneous cold requests made 1 OSRM call.
+   - **Concurrent requests for the same uncached route share one upstream call** (`fuel/services/singleflight.py`): a lock in this process plus a cache lock, with the cache re-checked once the lock is held. Live test: 6 simultaneous cold requests made 1 OSRM call.
+     - Within a process this always holds.
+     - Across processes (shared cache) it holds unless the upstream call outlives the cache lock. The lock is sized to the worst case (rate-limit wait + connect timeout + read timeout + 5 s, ~50 s), but an upstream that keeps trickling bytes could outlast it, and a waiter could then make a second call. So it is best-effort.
    - Failures are cached briefly (30 s for errors, 1 h for "no route"), so an outage doesn't cause a stampede.
    - The response is validated: distances must be finite and non-negative, the polyline must decode completely, and coordinates must be in range. Anything else returns 502, never 500. Malformed steps are skipped, because they only feed highway matching.
 4. **Stations on the route.** All stations are held in memory in an immutable snapshot: a KD-tree for exact great-circle queries, plus each station's details. A request uses one snapshot from start to finish, so a price reload mid-request can't mix two datasets. The route is densified to 1-mile steps, and stations whose city lies within 15 miles are candidates. A candidate is accepted only if:
@@ -137,6 +142,7 @@ request ─► resolve start/finish ─► OSRM route (1 call, cached) ─► st
   - So the 500-mile feasibility of a plan is also an estimate.
   - The biggest remaining accuracy gain would be true station coordinates, which no free source provides for addresses like "I-44, EXIT 283".
 - **Starting fuel.** The default is 3 gallons (30 miles), the same for every plan. Pass `start_fuel_gallons` to change it.
+- **Data coverage.** The provided price file has only 8 stations in California (all in Imperial/Riverside County) and none in Hawaii, so many trips there can't be planned. For example, San Francisco → Los Angeles returns 422 on the default 3 gallons, and works with `start_fuel_gallons=50`. The error message says this. It's a limit of the input data, not the planner.
 - **Arrive empty.** The plan buys only the fuel the trip needs.
 - Only Interstate and US routes are matched; state-route names differ too much between OSM and the price file. About 15% of stations name no I-/US- route, and they are used only when within 2 miles of the route.
 - All settings (range, mpg, corridor widths, default start fuel, cache lifetimes, service URLs) can be changed through environment variables; see `.env.example`.
@@ -168,7 +174,7 @@ fuel/management/commands/       load_stations, build_us_boundary
 fuel/services/geo.py            start/finish resolution, geocode cache + rate limit
 fuel/services/boundary.py       offline point-in-US-polygon check
 fuel/services/routing.py        OSRM client: one call, validated, cached, coalesced
-fuel/services/singleflight.py   one upstream call per key across concurrent requests
+fuel/services/singleflight.py   coalesces concurrent requests for the same key into one upstream call
 fuel/services/ratelimit.py      1 request/second limits for OSRM and Nominatim
 fuel/services/highways.py       I-/US- highway refs from addresses and route steps
 fuel/services/stations.py       versioned immutable station snapshot + corridor search

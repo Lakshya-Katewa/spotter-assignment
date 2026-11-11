@@ -73,8 +73,9 @@ def get_route(start_lat, start_lon, end_lat, end_lon) -> Route:
             key,
             lambda: _fetch(start_lat, start_lon, end_lat, end_lon),
             ttl=_ttl,
-            lock_seconds=settings.EXTERNAL_TIMEOUT + 5,
-            wait_seconds=settings.EXTERNAL_TIMEOUT + 5,
+            # Leader's worst case: rate-limit wait + connect timeout + read timeout.
+            lock_seconds=settings.ROUTING_MAX_WAIT_SECONDS + 2 * settings.EXTERNAL_TIMEOUT + 5,
+            wait_seconds=settings.ROUTING_MAX_WAIT_SECONDS + 2 * settings.EXTERNAL_TIMEOUT + 5,
         )
     except singleflight.Busy:
         raise RoutingError("Routing is busy; please retry.", status=503) from None
