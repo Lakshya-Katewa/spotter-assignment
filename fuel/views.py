@@ -3,9 +3,32 @@ from django.urls import reverse
 from django.utils.http import urlencode
 from rest_framework import serializers
 from rest_framework.response import Response
-from rest_framework.views import APIView
+from rest_framework.throttling import AnonRateThrottle
+from rest_framework.views import APIView, exception_handler
 
 from fuel.services.planner import PlanError, build_plan
+
+
+RETRY_AFTER_SECONDS = "5"
+
+
+def _error_response(exc: PlanError):
+    response = Response({"error": str(exc)}, status=exc.status)
+    if exc.status == 503:
+        response["Retry-After"] = RETRY_AFTER_SECONDS
+    return response
+
+
+def api_exception_handler(exc, context):
+    """DRF errors (validation, throttling) in the same {"error": ...} shape as ours."""
+    response = exception_handler(exc, context)
+    if response is not None:
+        details = response.data
+        message = details.get("detail") if isinstance(details, dict) and "detail" in details else "Invalid request."
+        response.data = {"error": str(message)}
+        if not (isinstance(details, dict) and set(details) == {"detail"}):
+            response.data["details"] = details
+    return response
 
 
 class RouteQuerySerializer(serializers.Serializer):
@@ -18,7 +41,7 @@ class RouteQuerySerializer(serializers.Serializer):
     )
     start_fuel_gallons = serializers.FloatField(
         required=False, allow_null=True, default=None, min_value=0,
-        help_text="Fuel already in the tank at the start. Omit for 'nearly empty'.",
+        help_text="Fuel in the tank at the start (gallons). Default: DEFAULT_START_FUEL_GALLONS (3).",
     )
 
 
@@ -49,7 +72,7 @@ class RoutePlanView(APIView):
                 start_fuel_gallons=q.validated_data["start_fuel_gallons"],
             )
         except PlanError as exc:
-            return Response({"error": str(exc)}, status=exc.status)
+            return _error_response(exc)
         data["map_url"] = request.build_absolute_uri(
             reverse("route-map")
             + "?"
@@ -75,7 +98,10 @@ def route_map(request):
     ctx = {"start": start, "finish": finish, "min_stop_savings": savings, "start_fuel_gallons": start_fuel,
            "plan": None, "error": None}
     status = 200
-    if start and finish:
+    throttle = AnonRateThrottle()  # the page plans routes too, so it shares the API's limit
+    if start and finish and not throttle.allow_request(request, None):
+        ctx["error"], status = "Too many requests; please wait a moment.", 429
+    elif start and finish:
         try:
             ctx["plan"] = build_plan(
                 start,
@@ -87,4 +113,7 @@ def route_map(request):
             ctx["error"], status = str(exc), exc.status
         except ValueError:
             ctx["error"], status = "min_stop_savings and start_fuel_gallons must be numbers.", 400
-    return render(request, "fuel/map.html", ctx, status=status)
+    response = render(request, "fuel/map.html", ctx, status=status)
+    if status in (429, 503):
+        response["Retry-After"] = str(int(throttle.wait() or 0) or RETRY_AFTER_SECONDS) if status == 429 else RETRY_AFTER_SECONDS
+    return response

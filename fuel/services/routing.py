@@ -6,21 +6,27 @@ steps tell us which Interstate/US highways the route uses, and where.
 * Concurrent requests for the same uncached route share one upstream call
   (see singleflight). Failures are cached briefly so an outage doesn't cause a
   stampede: 30 s for upstream errors, 1 h for "no route" (deterministic).
+* Calls are rate-limited to 1/second, per the demo server's usage policy.
+* The cache stores the encoded polyline (~120 KB for a cross-country route)
+  rather than decoded coordinates (~780 KB pickled); decoding takes ~20 ms.
 * Every field of the upstream response is validated; anything malformed becomes
   a controlled RoutingError (502) instead of an unhandled exception.
 """
 
+import logging
 import math
-from dataclasses import dataclass, replace
+import time
+from dataclasses import dataclass
 
 import requests
 from django.conf import settings
 
-from fuel.services import singleflight
+from fuel.services import ratelimit, singleflight
 from fuel.services.highways import spans_from_steps
 from fuel.services.polyline import decode
 
 METERS_PER_MILE = 1609.344
+logger = logging.getLogger(__name__)
 
 
 class RoutingError(RuntimeError):
@@ -36,6 +42,16 @@ class Route:
     coordinates: list  # [[lon, lat], ...] (GeoJSON order)
     highways: list = None  # [(start_mile, end_mile, frozenset of refs)] from the route steps
     from_cache: bool = False
+
+
+@dataclass(frozen=True)
+class _Compact:
+    """What the cache holds: the route with its geometry still encoded."""
+
+    distance_miles: float
+    duration_seconds: float
+    polyline: str
+    highways: list
 
 
 @dataclass(frozen=True)
@@ -64,12 +80,25 @@ def get_route(start_lat, start_lon, end_lat, end_lon) -> Route:
         raise RoutingError("Routing is busy; please retry.", status=503) from None
     if isinstance(result, _Failure):
         raise RoutingError(result.message, result.status)
-    return replace(result, from_cache=True) if cached else result
+    return Route(
+        distance_miles=result.distance_miles,
+        duration_seconds=result.duration_seconds,
+        coordinates=decode(result.polyline),  # validated before caching
+        highways=result.highways,
+        from_cache=cached,
+    )
 
 
 def _fetch(start_lat, start_lon, end_lat, end_lon):
-    """One HTTP call. Returns a Route or a _Failure (never raises for upstream problems)."""
+    """One HTTP call. Returns a _Compact or a _Failure (cached briefly).
+
+    Raises RoutingError(503) without caching if the rate limit can't be met in time.
+    """
     url = f"{settings.OSRM_URL}/route/v1/driving/{start_lon},{start_lat};{end_lon},{end_lat}"
+    try:
+        ratelimit.acquire("osrm", time.monotonic() + settings.ROUTING_MAX_WAIT_SECONDS)
+    except ratelimit.RateLimited:
+        raise RoutingError("Routing is busy; please retry in a moment.", status=503) from None
     try:
         r = requests.get(
             url,
@@ -79,11 +108,15 @@ def _fetch(start_lat, start_lon, end_lat, end_lon):
         )
         data = r.json()
     except (requests.RequestException, ValueError) as exc:
+        logger.warning("OSRM request failed: %s", exc)
         return _Failure(f"Routing service unavailable: {exc}", 502)
     try:
-        return parse_osrm(r.status_code, data)
+        route = parse_osrm(r.status_code, data)
     except RoutingError as exc:
+        if exc.status != 422:
+            logger.warning("OSRM error (HTTP %s): %s", r.status_code, exc)
         return _Failure(str(exc), exc.status)
+    return _Compact(route.distance_miles, route.duration_seconds, data["routes"][0]["geometry"], route.highways)
 
 
 def _is_number(value):

@@ -23,7 +23,7 @@ Then:
 
 - API: <http://127.0.0.1:8000/api/route/?start=New%20York,%20NY&finish=Los%20Angeles,%20CA>
 - Map: <http://127.0.0.1:8000/map/?start=New%20York,%20NY&finish=Los%20Angeles,%20CA>
-- Tests: `python manage.py test fuel` (54 tests, no network needed)
+- Tests: `python manage.py test fuel` (62 tests, no network needed)
 - Postman: import `postman_collection.json`
 
 ## API
@@ -75,7 +75,10 @@ Status codes:
 | 400 | Bad input or a location outside the USA |
 | 422 | No drivable route, or a stretch with no reachable station within range |
 | 502 | The routing or geocoding service failed or returned a malformed response |
-| 503 | Temporarily busy: the geocoder rate limit, waiting for a concurrent identical request, or station data being reloaded |
+| 429 | Too many requests from this client (default 60/min, `API_THROTTLE_RATE`); includes `Retry-After` |
+| 503 | Temporarily busy: an upstream rate limit, waiting for a concurrent identical request, or station data being reloaded; includes `Retry-After` |
+
+All errors use the same shape: `{"error": "…"}`, plus `"details"` for field validation errors. Responses are gzip-compressed when the client accepts it (NY→LA: 86 KB → 26 KB).
 
 ### `GET /map/?start=…&finish=…`
 
@@ -103,7 +106,8 @@ request ─► resolve start/finish ─► OSRM route (1 call, cached) ─► st
      - Every response field is validated; malformed data returns 502.
    - Every location must fall inside the Census US national boundary (`data/us_boundary.json`, 5 m resolution, checked locally in about 0.1 ms). Windsor, Tijuana and Juárez are rejected; Detroit, San Ysidro and El Paso are accepted.
 3. **Route.** One call to the public [OSRM](https://project-osrm.org/) server returns the full geometry (encoded polyline) and the route steps. The steps tell us which Interstate and US highways the route uses, and over which miles.
-   - Routes are cached for 24 hours.
+   - Routes are cached for 24 hours. The cache keeps the encoded polyline (~120 KB for a cross-country route), not decoded coordinates (~780 KB); decoding on use takes ~20 ms.
+   - Calls are rate-limited to **1 per second**, as the demo server's usage policy requires (`fuel/services/ratelimit.py`, shared with Nominatim). Call starts are spaced at least 1.05 s apart. If no slot frees up within 5 seconds, the request returns 503 and the failure is not cached.
    - **Concurrent requests for the same uncached route make one upstream call** (`fuel/services/singleflight.py`): a lock in this process plus a short cache lock, with the cache re-checked once the lock is held. Live test: 6 simultaneous cold requests made 1 OSRM call.
    - Failures are cached briefly (30 s for errors, 1 h for "no route"), so an outage doesn't cause a stampede.
    - The response is validated: distances must be finite and non-negative, the polyline must decode completely, and coordinates must be in range. Anything else returns 502, never 500. Malformed steps are skipped, because they only feed highway matching.
@@ -136,7 +140,12 @@ request ─► resolve start/finish ─► OSRM route (1 call, cached) ─► st
 - **Arrive empty.** The plan buys only the fuel the trip needs.
 - Only Interstate and US routes are matched; state-route names differ too much between OSM and the price file. About 15% of stations name no I-/US- route, and they are used only when within 2 miles of the route.
 - All settings (range, mpg, corridor widths, default start fuel, cache lifetimes, service URLs) can be changed through environment variables; see `.env.example`.
-- **Multiple workers.** By default the cache is in-process: zero setup, and correct for a single process. Set `REDIS_URL` (and `pip install redis`) to share the caches, the request coalescing and the Nominatim rate limit across all worker processes. Without it, each process coalesces and rate-limits on its own.
+- **Multiple workers.** By default the cache is in-process: zero setup, and correct for a single process. Set `REDIS_URL` (and `pip install redis`) to share the caches, the request coalescing and both upstream rate limits across all worker processes. Without it, each process coalesces and rate-limits on its own.
+- **Free upstream services.** Both allow 1 request per second in total, and the client-side limiter spaces the actual call starts at least 1 second apart. Measured live: 4 concurrent new routes started their OSRM calls 1.054–1.055 s apart.
+  - The spacing uses stored timestamps, not key expiry, because some caches (Memcached) can expire a 1-second key early.
+  - A per-client throttle on this API (map page included, default 60/min) limits abuse. It does **not** guarantee fair use of the upstream budget: one client making new routes as fast as allowed can still use all of it, and other clients then get 503 until a slot frees up. Preventing that would need per-client quotas on upstream calls, which is out of scope here.
+  - Upstream failures are logged as warnings on the `fuel` logger.
+- **Deployment.** `DEBUG` defaults to on for local review. Set `DJANGO_DEBUG=0`, a real `DJANGO_SECRET_KEY` and `DJANGO_ALLOWED_HOSTS` for anything public.
 
 ## Performance
 
@@ -160,6 +169,7 @@ fuel/services/geo.py            start/finish resolution, geocode cache + rate li
 fuel/services/boundary.py       offline point-in-US-polygon check
 fuel/services/routing.py        OSRM client: one call, validated, cached, coalesced
 fuel/services/singleflight.py   one upstream call per key across concurrent requests
+fuel/services/ratelimit.py      1 request/second limits for OSRM and Nominatim
 fuel/services/highways.py       I-/US- highway refs from addresses and route steps
 fuel/services/stations.py       versioned immutable station snapshot + corridor search
 fuel/services/optimizer.py      cheapest refuelling plan + optional stop consolidation

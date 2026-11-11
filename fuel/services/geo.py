@@ -11,9 +11,9 @@ Every result must fall inside the US national boundary (checked offline).
 """
 
 import hashlib
+import logging
 import math
 import re
-import threading
 import time
 from dataclasses import dataclass
 
@@ -22,7 +22,7 @@ from django.conf import settings
 from django.core.cache import cache
 
 from fuel.models import Place
-from fuel.services import boundary, singleflight
+from fuel.services import boundary, ratelimit, singleflight
 from fuel.services.names import CANADIAN_PROVINCES, place_key
 
 EARTH_RADIUS_MI = 3958.7613
@@ -42,6 +42,7 @@ STATE_NAMES = {
 }
 STATE_CODES = set(STATE_NAMES.values())
 
+logger = logging.getLogger(__name__)
 _LATLON = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
 
 
@@ -125,32 +126,8 @@ def _from_local_places(query):
 
 
 # -- Nominatim -----------------------------------------------------------------
-_rate_lock = threading.Lock()
-_RATE_KEY = "nominatim:slot"
-
-
 class GeocoderBadResponse(GeocoderUnavailable):
     status = 502
-
-
-def _acquire_rate_slot(deadline):
-    """Reserve one Nominatim request slot (max 1 per second) before `deadline`.
-
-    `cache.add` is atomic, so with a shared cache (Redis) the limit holds across
-    all worker processes; with the default in-process cache it holds per process.
-    The whole wait, including queueing behind other threads, is bounded.
-    """
-    if not _rate_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
-        raise GeocoderUnavailable("Geocoder is busy; please retry in a moment.")
-    try:
-        while True:
-            if time.monotonic() >= deadline:
-                raise GeocoderUnavailable("Geocoder is busy; please retry in a moment.")
-            if cache.add(_RATE_KEY, 1, timeout=1):
-                return
-            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-    finally:
-        _rate_lock.release()
 
 
 def _cache_key(query):
@@ -180,7 +157,10 @@ def _from_nominatim(query):
     deadline = time.monotonic() + settings.GEOCODE_MAX_WAIT_SECONDS
 
     def lookup():
-        _acquire_rate_slot(deadline)
+        try:
+            ratelimit.acquire("nominatim", deadline)
+        except ratelimit.RateLimited:
+            raise GeocoderUnavailable("Geocoder is busy; please retry in a moment.") from None
         try:
             r = requests.get(
                 settings.NOMINATIM_URL,
@@ -191,8 +171,13 @@ def _from_nominatim(query):
             r.raise_for_status()
             hits = r.json()
         except (requests.RequestException, ValueError) as exc:
+            logger.warning("Nominatim request failed: %s", exc)
             raise GeocoderUnavailable(f"Could not geocode '{query}': {exc}") from exc
-        return parse_nominatim(hits, query)
+        try:
+            return parse_nominatim(hits, query)
+        except GeocoderBadResponse:
+            logger.warning("Malformed Nominatim response: %.200r", hits)
+            raise
 
     # Identical concurrent lookups share one request; waiting re-checks the cache.
     try:

@@ -47,6 +47,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'django.middleware.gzip.GZipMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -141,6 +142,8 @@ EXTERNAL_TIMEOUT = float(os.getenv("EXTERNAL_TIMEOUT", "20"))
 GEOCODE_CACHE_SECONDS = int(os.getenv("GEOCODE_CACHE_SECONDS", str(30 * 24 * 3600)))
 GEOCODE_NEGATIVE_CACHE_SECONDS = int(os.getenv("GEOCODE_NEGATIVE_CACHE_SECONDS", "3600"))
 GEOCODE_MAX_WAIT_SECONDS = float(os.getenv("GEOCODE_MAX_WAIT_SECONDS", "5"))
+# Max wait for an OSRM request slot (the demo server allows 1 request/second).
+ROUTING_MAX_WAIT_SECONDS = float(os.getenv("ROUTING_MAX_WAIT_SECONDS", "5"))
 
 VEHICLE_MAX_RANGE_MILES = float(os.getenv("VEHICLE_MAX_RANGE_MILES", "500"))
 VEHICLE_MPG = float(os.getenv("VEHICLE_MPG", "10"))
@@ -173,5 +176,18 @@ else:
 
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer", "rest_framework.renderers.BrowsableAPIRenderer"],
+    # Per-client limit to curb abuse. It does NOT reserve upstream capacity: both free
+    # services allow 1 request/second in total, and 60/min from one client can still
+    # use all of it. Fair sharing would need per-client quotas on upstream calls.
+    "DEFAULT_THROTTLE_CLASSES": ["rest_framework.throttling.AnonRateThrottle"],
+    "DEFAULT_THROTTLE_RATES": {"anon": os.getenv("API_THROTTLE_RATE", "60/min")},
+    "EXCEPTION_HANDLER": "fuel.views.api_exception_handler",
     "URL_FORMAT_OVERRIDE": None,  # keep ?format free; we don't use it
+}
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "loggers": {"fuel": {"handlers": ["console"], "level": os.getenv("FUEL_LOG_LEVEL", "INFO")}},
 }

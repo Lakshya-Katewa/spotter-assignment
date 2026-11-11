@@ -10,7 +10,7 @@ from django.core.cache import cache
 from django.test import SimpleTestCase, TestCase, override_settings
 
 from fuel.models import DatasetVersion, FuelStation, Place
-from fuel.services import geo, highways, routing
+from fuel.services import geo, highways, ratelimit, routing
 from fuel.services.boundary import contains
 from fuel.services.geo import GeocoderUnavailable, LocationError, resolve
 from fuel.services.names import name_variants, normalize, place_key
@@ -19,6 +19,12 @@ from fuel.services.polyline import decode, simplify
 from fuel.services.stations import densify, reset_index
 
 TANK = 50  # gallons: 500-mile range at 10 mpg
+
+# Upstream-failure tests trigger warning logs on purpose; keep test output clean.
+# (ApiHygieneTests.test_failures_are_logged checks that the warnings are emitted.)
+import logging  # noqa: E402
+
+logging.getLogger("fuel").setLevel(logging.CRITICAL)
 
 
 # -- helpers -----------------------------------------------------------------
@@ -258,9 +264,18 @@ OSRM_OK = {
 }
 
 
-class RoutingClientTests(SimpleTestCase):
+class NoRateLimitMixin:
+    """Tests not about rate limiting skip the 1 request/second wait between mocked calls."""
+
     def setUp(self):
+        super().setUp()
         cache.clear()
+        patcher = mock.patch("fuel.services.ratelimit.acquire")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class RoutingClientTests(NoRateLimitMixin, SimpleTestCase):
 
     @mock.patch("fuel.services.routing.requests.get")
     def test_single_request_with_expected_params_then_cached(self, get):
@@ -354,7 +369,7 @@ class GeocodingTests(TestCase):
     @override_settings(GEOCODE_MAX_WAIT_SECONDS=0.1)
     @mock.patch("fuel.services.geo.requests.get")
     def test_busy_limiter_returns_503_instead_of_exceeding_rate(self, get):
-        cache.add(geo._RATE_KEY, 1, timeout=60)
+        cache.set(ratelimit.last_call_key("nominatim"), time.time() + 60, timeout=120)  # next slot is a minute away
         with self.assertRaises(GeocoderUnavailable) as ctx:
             resolve("3 Third St, Washington, DC")
         self.assertEqual(ctx.exception.status, 503)
@@ -599,19 +614,17 @@ class ConcurrencyTests(SimpleTestCase):
 
     @override_settings(GEOCODE_MAX_WAIT_SECONDS=0.2)
     def test_limiter_wait_is_bounded_even_behind_the_lock(self):
-        geo._rate_lock.acquire()  # another thread is stuck holding the limiter
+        ratelimit._locks["nominatim"].acquire()  # another thread is stuck holding the limiter
         try:
             t0 = time.monotonic()
             with self.assertRaises(GeocoderUnavailable):
                 resolve("5 Fifth St, Washington, DC")
             self.assertLess(time.monotonic() - t0, 1.0)
         finally:
-            geo._rate_lock.release()
+            ratelimit._locks["nominatim"].release()
 
 
-class MalformedUpstreamTests(SimpleTestCase):
-    def setUp(self):
-        cache.clear()
+class MalformedUpstreamTests(NoRateLimitMixin, SimpleTestCase):
 
     def test_malformed_osrm_responses_become_502(self):
         good = OSRM_OK["routes"][0]
@@ -654,8 +667,7 @@ class MalformedUpstreamTests(SimpleTestCase):
             r = mock.Mock(status_code=200)
             r.raise_for_status.return_value = None
             r.json.return_value = payload
-            with self.subTest(name), mock.patch("fuel.services.geo.requests.get", return_value=r), \
-                    mock.patch("fuel.services.geo._acquire_rate_slot"):
+            with self.subTest(name), mock.patch("fuel.services.geo.requests.get", return_value=r):
                 with self.assertRaises(GeocoderUnavailable) as ctx:
                     resolve(f"{i} Main St, Springfield, IL")
                 self.assertEqual(ctx.exception.status, 502)
@@ -699,3 +711,135 @@ class SnapshotTests(ApiFixture):
         self.assertEqual(r.status_code, 200, r.content)
         s = r.json()["summary"]
         self.assertEqual((s["total_fuel_cost"], s["number_of_stops"]), (0, 0))
+
+
+# -- review round 3: upstream policy, memory, API hygiene --------------------
+import gzip  # noqa: E402
+import json  # noqa: E402
+import pickle  # noqa: E402
+
+from rest_framework.throttling import AnonRateThrottle  # noqa: E402
+
+
+class OsrmPolicyTests(SimpleTestCase):
+    def setUp(self):
+        cache.clear()
+
+    def test_outbound_call_starts_are_at_least_one_second_apart(self):
+        """Timestamps taken at the actual outbound call, with concurrent distinct routes."""
+        starts = []
+
+        def record(*_a, **_kw):
+            starts.append(time.time())
+            return osrm_response(payload=OSRM_OK)
+
+        coords = iter(range(4))
+        with mock.patch("fuel.services.routing.requests.get", side_effect=record):
+            _, errors = run_concurrently(lambda: routing.get_route(30 + next(coords), -120.2, 40.7, -120.95), n=4)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(starts), 4)
+        gaps = [b - a for a, b in zip(sorted(starts), sorted(starts)[1:])]
+        self.assertGreaterEqual(min(gaps), 1.0, gaps)
+
+    @override_settings(GEOCODE_MAX_WAIT_SECONDS=10)
+    def test_geocoder_call_starts_are_at_least_one_second_apart(self):
+        starts = []
+
+        def record(*_a, **_kw):
+            starts.append(time.time())
+            return nominatim(38.9, -77.0)
+
+        n = iter(range(3))
+        with mock.patch("fuel.services.geo.requests.get", side_effect=record):
+            _, errors = run_concurrently(lambda: resolve(f"{next(n)} Main St, Washington, DC"), n=3)
+        self.assertEqual(errors, [])
+        gaps = [b - a for a, b in zip(sorted(starts), sorted(starts)[1:])]
+        self.assertGreaterEqual(min(gaps), 1.0, gaps)
+
+    def test_spacing_does_not_depend_on_key_expiry(self):
+        """Backends like Memcached may expire a 1-second key early; spacing must still hold."""
+        real_add = cache.add
+
+        def add_with_short_expiry(key, value, timeout=None, **kw):
+            return real_add(key, value, timeout=0.01 if timeout else timeout, **kw)  # expires almost at once
+
+        starts = []
+        with mock.patch.object(cache, "add", side_effect=add_with_short_expiry):
+            for _ in range(3):
+                ratelimit.acquire("osrm", time.monotonic() + 5)
+                starts.append(time.time())
+        gaps = [b - a for a, b in zip(starts, starts[1:])]
+        self.assertGreaterEqual(min(gaps), 1.0, gaps)
+
+    @override_settings(ROUTING_MAX_WAIT_SECONDS=0.1)
+    @mock.patch("fuel.services.routing.requests.get")
+    def test_saturated_limit_is_503_and_not_cached(self, get):
+        get.return_value = osrm_response(payload=OSRM_OK)
+        cache.set(ratelimit.last_call_key("osrm"), time.time() + 60, timeout=120)  # next slot is a minute away
+        with self.assertRaises(routing.RoutingError) as ctx:
+            routing.get_route(38.5, -120.2, 40.7, -120.95)
+        self.assertEqual(ctx.exception.status, 503)
+        get.assert_not_called()
+        cache.delete(ratelimit.last_call_key("osrm"))
+        self.assertAlmostEqual(routing.get_route(38.5, -120.2, 40.7, -120.95).distance_miles, 100)  # not a cached failure
+
+    @mock.patch("fuel.services.routing.requests.get")
+    def test_cache_holds_compact_polyline(self, get):
+        long_line = [[-100 + i * 0.001, 40 + i * 0.0005] for i in range(20000)]
+        payload = json.loads(json.dumps(OSRM_OK))
+        payload["routes"][0]["geometry"] = encode(long_line)
+        get.return_value = osrm_response(payload=payload)
+        fresh = routing.get_route(38.5, -120.2, 40.7, -120.95)
+        stored = cache.get("route:38.50000,-120.20000:40.70000,-120.95000")
+        self.assertIsInstance(stored.polyline, str)
+        self.assertLess(len(pickle.dumps(stored)), len(pickle.dumps(fresh)) / 4)
+        again = routing.get_route(38.5, -120.2, 40.7, -120.95)
+        self.assertTrue(again.from_cache)
+        self.assertEqual(again.coordinates, fresh.coordinates)
+
+
+class ApiHygieneTests(ApiFixture):
+    @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
+    def test_gzip(self, _):
+        r = self.client.get("/api/route/", {"start": "Southtown, NE", "finish": "Northtown, ND"}, HTTP_ACCEPT_ENCODING="gzip")
+        self.assertEqual(r["Content-Encoding"], "gzip")
+        self.assertIn("fuel_stops", json.loads(gzip.decompress(r.content)))
+
+    def test_validation_errors_share_the_error_shape(self):
+        r = self.client.get("/api/route/", {"start": "Southtown, NE"})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["error"], "Invalid request.")
+        self.assertIn("finish", r.json()["details"])
+
+    @mock.patch("fuel.services.routing.get_route", side_effect=routing.RoutingError("busy", status=503))
+    def test_503_has_retry_after(self, _):
+        r = self.get()
+        self.assertEqual(r.status_code, 503)
+        self.assertEqual(r["Retry-After"], "5")
+
+    @mock.patch.object(AnonRateThrottle, "THROTTLE_RATES", {"anon": "2/min"})
+    @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
+    def test_api_and_map_page_are_throttled_per_client(self, _):
+        self.assertEqual(self.get().status_code, 200)
+        self.assertEqual(self.get().status_code, 200)
+        r = self.get()
+        self.assertEqual(r.status_code, 429)
+        self.assertIn("error", r.json())
+        self.assertIn("Retry-After", r)
+        page = self.client.get("/map/", {"start": "Southtown, NE", "finish": "Northtown, ND"})
+        self.assertEqual(page.status_code, 429)
+        self.assertIn("Retry-After", page)
+        self.assertEqual(self.client.get("/map/").status_code, 200)  # the empty form isn't throttled
+
+    @mock.patch("fuel.services.routing.requests.get", side_effect=requests.ConnectionError("down"))
+    def test_failures_are_logged(self, _):
+        logger = logging.getLogger("fuel")
+        old = logger.level
+        logger.setLevel(logging.WARNING)
+        try:
+            with self.assertLogs("fuel.services.routing", "WARNING") as logs, mock.patch("fuel.services.ratelimit.acquire"):
+                with self.assertRaises(routing.RoutingError):
+                    routing.get_route(10.5, -120.2, 40.7, -120.95)
+        finally:
+            logger.setLevel(old)
+        self.assertIn("OSRM request failed", logs.output[0])
