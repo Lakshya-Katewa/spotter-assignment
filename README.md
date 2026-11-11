@@ -225,3 +225,9 @@ data/geocode_overrides.json     coordinates for places missing from the Census f
 data/us_boundary.json           Census US boundary (built by build_us_boundary)
 data/exit_locations.json        station positions at interstate exits (built by build_exit_locations)
 ```
+
+## Author
+
+**Lakshya Katewa**
+- LinkedIn: https://www.linkedin.com/in/lakshya-katewa-73344a295/
+- GitHub: https://github.com/Lakshya-Katewa
