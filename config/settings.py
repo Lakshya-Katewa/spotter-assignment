@@ -30,10 +30,15 @@ DEBUG = os.getenv('DJANGO_DEBUG', '1') == '1'
 _DEV_SECRET_KEY = 'django-insecure-dev-only-change-me'
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', _DEV_SECRET_KEY)
 if not DEBUG:
-    if SECRET_KEY == _DEV_SECRET_KEY:
+    # Reject the dev default, the .env.example placeholder and anything short or obviously fake.
+    if (SECRET_KEY == _DEV_SECRET_KEY or len(SECRET_KEY) < 50 or len(set(SECRET_KEY)) < 10
+            or any(w in SECRET_KEY.lower() for w in ("change-me", "changeme", "insecure", "secret"))):
         from django.core.exceptions import ImproperlyConfigured
 
-        raise ImproperlyConfigured("Set DJANGO_SECRET_KEY when DJANGO_DEBUG=0.")
+        raise ImproperlyConfigured(
+            "Set DJANGO_SECRET_KEY to a long random value when DJANGO_DEBUG=0 "
+            "(python -c 'from django.core.management.utils import get_random_secret_key as k; print(k())')."
+        )
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
     SECURE_SSL_REDIRECT = os.getenv('DJANGO_SECURE_SSL_REDIRECT', '1') == '1'
@@ -94,6 +99,8 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'db.sqlite3',
+        # WAL: readers aren't blocked while load_stations rewrites the prices.
+        'OPTIONS': {'init_command': 'PRAGMA journal_mode=WAL;'},
     }
 }
 
@@ -152,7 +159,8 @@ if DEBUG:
 OSRM_URL = os.getenv("OSRM_URL", "https://router.project-osrm.org").rstrip("/")
 NOMINATIM_URL = os.getenv("NOMINATIM_URL", "https://nominatim.openstreetmap.org/search")
 HTTP_USER_AGENT = os.getenv("HTTP_USER_AGENT", "fuel-route-planner/1.0 (Django assessment)")
-EXTERNAL_TIMEOUT = float(os.getenv("EXTERNAL_TIMEOUT", "20"))
+# Per connect/read timeout for OSRM and Nominatim. A cross-country OSRM route takes ~1.5 s.
+EXTERNAL_TIMEOUT = float(os.getenv("EXTERNAL_TIMEOUT", "10"))
 GEOCODE_CACHE_SECONDS = int(os.getenv("GEOCODE_CACHE_SECONDS", str(30 * 24 * 3600)))
 GEOCODE_NEGATIVE_CACHE_SECONDS = int(os.getenv("GEOCODE_NEGATIVE_CACHE_SECONDS", "3600"))
 GEOCODE_MAX_WAIT_SECONDS = float(os.getenv("GEOCODE_MAX_WAIT_SECONDS", "5"))
@@ -169,11 +177,19 @@ STATION_NEAR_ROUTE_MILES = float(os.getenv("STATION_NEAR_ROUTE_MILES", "2"))
 # Stations placed at their interstate exit (exact position) must be this close to the route.
 # The route is sampled every mile, so ~0.5 mi of this is sampling error.
 EXIT_NEAR_ROUTE_MILES = float(os.getenv("EXIT_NEAR_ROUTE_MILES", "1"))
-# Empty start (the default): the first purchase may be at any station within this many
-# route miles of the start; the drive there is billed at that station's price.
+# Fuel already in the tank at the start when the caller doesn't pass start_fuel_gallons.
+# Unset/empty (the default) = "pay for all fuel": the vehicle starts with just enough to
+# reach its first stop, charged at that stop's price, so the total covers every mile.
+# A number (e.g. 50 = full tank) = that much fuel already in the tank, not charged.
+DEFAULT_START_FUEL_GALLONS = float(os.getenv("DEFAULT_START_FUEL_GALLONS")) if os.getenv("DEFAULT_START_FUEL_GALLONS") else None
+# Pay-for-all-fuel start: the first stop may be any station within this many route
+# miles of the start.
 START_APPROACH_MILES = float(os.getenv("START_APPROACH_MILES", "30"))
-# Skip a fuel stop when it saves less than this many dollars (0 = strictly cheapest plan).
-MIN_STOP_SAVINGS = float(os.getenv("MIN_STOP_SAVINGS", "0"))
+# Skip a fuel stop when it saves less than this many dollars. Default 5: the strictly
+# cheapest plan is full of 1-gallon top-ups (16 stops NY->LA, vs 9 for $4.98 more), which
+# no driver would make. The response always reports the strictly cheapest cost too;
+# pass min_stop_savings=0 for that plan.
+MIN_STOP_SAVINGS = float(os.getenv("MIN_STOP_SAVINGS", "5"))
 # Threshold for the "fewer_stops_alternative" shown alongside the cheapest plan.
 FEWER_STOPS_SUGGESTION_SAVINGS = float(os.getenv("FEWER_STOPS_SUGGESTION_SAVINGS", "5"))
 ROUTE_CACHE_SECONDS = int(os.getenv("ROUTE_CACHE_SECONDS", str(24 * 3600)))
@@ -188,7 +204,8 @@ else:
         "default": {
             "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
             "LOCATION": "fuel-route-planner",
-            "OPTIONS": {"MAX_ENTRIES": 2000},
+            # ~80 KB per cached plan (with geometry) and ~120 KB per route: about 100 MB worst case.
+            "OPTIONS": {"MAX_ENTRIES": 500},
         }
     }
 
@@ -199,6 +216,9 @@ REST_FRAMEWORK = {
     # use all of it. Fair sharing would need per-client quotas on upstream calls.
     "DEFAULT_THROTTLE_CLASSES": ["rest_framework.throttling.AnonRateThrottle"],
     "DEFAULT_THROTTLE_RATES": {"anon": os.getenv("API_THROTTLE_RATE", "60/min")},
+    # Behind a reverse proxy, set to the number of proxies so throttling uses the client
+    # address from X-Forwarded-For instead of the proxy's.
+    "NUM_PROXIES": int(os.environ["DJANGO_NUM_PROXIES"]) if os.getenv("DJANGO_NUM_PROXIES") else None,
     "EXCEPTION_HANDLER": "fuel.views.api_exception_handler",
     "URL_FORMAT_OVERRIDE": None,  # keep ?format free; we don't use it
 }

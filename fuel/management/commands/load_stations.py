@@ -13,6 +13,7 @@ import csv
 import gzip
 import io
 import json
+import statistics
 import time
 import uuid
 import zipfile
@@ -151,16 +152,23 @@ class Command(BaseCommand):
 
     # -- stations ---------------------------------------------------------
     def _read_stations(self, path):
-        """Dedupe by OPIS id, keeping the lowest price; drop Canadian rows."""
-        stations = {}
+        """Dedupe by OPIS id, using the median price; drop Canadian rows.
+
+        678 OPIS ids appear 2-6 times with the same Rack ID and different prices
+        (spread up to $0.90). The file has no dates, so the rows can't be ordered or
+        told apart; they are treated as repeated observations of one station. The
+        median is robust to outliers, and doesn't bias the station low the way the
+        minimum would (the optimizer would then favour exactly these stations).
+        """
+        stations, prices = {}, {}
         with open(path, encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 state = row["State"].strip().upper()
                 if state in CANADIAN_PROVINCES:
                     continue
                 opis_id = int(row["OPIS Truckstop ID"])
-                price = Decimal(row["Retail Price"]).quantize(Decimal("0.0001"))
-                if opis_id in stations and stations[opis_id]["price"] <= price:
+                prices.setdefault(opis_id, []).append(Decimal(row["Retail Price"]))
+                if opis_id in stations:
                     continue
                 stations[opis_id] = {
                     "opis_id": opis_id,
@@ -168,8 +176,9 @@ class Command(BaseCommand):
                     "address": row["Address"].strip(),
                     "city": row["City"].strip(),
                     "state": state,
-                    "price": price,
                 }
+        for opis_id, station in stations.items():
+            station["price"] = statistics.median(prices[opis_id]).quantize(Decimal("0.0001"))
         return stations
 
     def _geocode(self, keys):

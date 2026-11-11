@@ -100,11 +100,11 @@
       }
     },
     {
-      "name": "Plan route (GET) - full tank at start, fewer stops",
+      "name": "Plan route (GET) - full tank at start",
       "request": {
         "method": "GET",
         "url": {
-          "raw": "{{base_url}}/api/route/?start=Chicago, IL&finish=Dallas, TX&start_fuel_gallons=50&min_stop_savings=5&geometry=false",
+          "raw": "{{base_url}}/api/route/?start=Chicago, IL&finish=Dallas, TX&start_fuel_gallons=50&geometry=false",
           "host": [
             "{{base_url}}"
           ],
@@ -127,15 +127,48 @@
               "value": "50"
             },
             {
+              "key": "geometry",
+              "value": "false"
+            }
+          ]
+        },
+        "description": "start_fuel_gallons=50: the truck leaves with a full tank, which isn't charged; total_fuel_cost covers only fuel bought on the way."
+      }
+    },
+    {
+      "name": "Plan route (GET) - strictly cheapest plan",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/api/route/?start=Chicago, IL&finish=Dallas, TX&min_stop_savings=0&geometry=false",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "route",
+            ""
+          ],
+          "query": [
+            {
+              "key": "start",
+              "value": "Chicago, IL"
+            },
+            {
+              "key": "finish",
+              "value": "Dallas, TX"
+            },
+            {
               "key": "min_stop_savings",
-              "value": "5"
+              "value": "0"
             },
             {
               "key": "geometry",
               "value": "false"
             }
           ]
-        }
+        },
+        "description": "min_stop_savings=0: the strictly cheapest plan (more, smaller stops). fewer_stops_alternative shows the default $5 plan next to it."
       }
     },
     {
@@ -193,6 +226,38 @@
       }
     },
     {
+      "name": "No price data on route - 422 with route (SF to LA)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/api/route/?start=San Francisco, CA&finish=Los Angeles, CA&geometry=false",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "route",
+            ""
+          ],
+          "query": [
+            {
+              "key": "start",
+              "value": "San Francisco, CA"
+            },
+            {
+              "key": "finish",
+              "value": "Los Angeles, CA"
+            },
+            {
+              "key": "geometry",
+              "value": "false"
+            }
+          ]
+        },
+        "description": "The price file has no station along this route: 422 with code no_stations_on_route, but the route, start, finish and map_url are still returned. Add start_fuel_gallons=50 to get a plan with no stops."
+      }
+    },
+    {
       "name": "Map page (open in browser)",
       "request": {
         "method": "GET",
@@ -216,6 +281,22 @@
             }
           ]
         }
+      }
+    },
+    {
+      "name": "Health check",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/healthz",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "healthz"
+          ]
+        },
+        "description": "200 when the station data is loaded; 503 otherwise. No upstream calls."
       }
     }
   ]

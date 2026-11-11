@@ -43,7 +43,7 @@
     <form method="get">
       <label>Start <input name="start" value="{{ start }}" placeholder="e.g. Chicago, IL" required></label>
       <label>Finish <input name="finish" value="{{ finish }}" placeholder="e.g. Dallas, TX" required></label>
-      <label>Skip stops saving less than ($) <input name="min_stop_savings" value="{{ min_stop_savings }}" placeholder="0 = cheapest possible" inputmode="decimal"></label>
+      <label>Skip stops saving less than ($) <input name="min_stop_savings" value="{{ min_stop_savings }}" placeholder="5 if blank; 0 = cheapest" inputmode="decimal"></label>
       <label>Fuel in tank at start (gal) <input name="start_fuel_gallons" value="{{ start_fuel_gallons }}" placeholder="empty if blank" inputmode="decimal"></label>
       <button type="submit">Plan route</button>
     </form>
@@ -87,11 +87,13 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 {{ plan|json_script:"plan-data" }}
+{{ route_only|json_script:"route-data" }}
 <script>
   // Data arrives via json_script (escaped for <script>), and all text goes into
   // the DOM as text nodes, never as HTML, so station names or geocoder labels
   // can't inject markup.
-  const plan = JSON.parse(document.getElementById('plan-data').textContent);
+  const plan = JSON.parse(document.getElementById('plan-data').textContent)
+    || JSON.parse(document.getElementById('route-data').textContent);  // route without a fuel plan
   const el = (tag, text) => { const e = document.createElement(tag); if (text != null) e.textContent = text; return e; };
   const popup = (lines) => {
     const box = el('div');
@@ -100,7 +102,7 @@
   };
   const map = L.map('map').setView([39.5, -98.35], 4);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 18, attribution: '&copy; OpenStreetMap contributors'
+    maxZoom: 18, attribution: '&copy; OpenStreetMap contributors (map tiles; interstate exit positions, ODbL)'
   }).addTo(map);
 
   if (plan) {
@@ -112,7 +114,7 @@
     };
     L.marker([plan.start.lat, plan.start.lon], { icon: pin('A', 'end') }).bindPopup(popup(['Start', plan.start.query_label])).addTo(map);
     L.marker([plan.finish.lat, plan.finish.lon], { icon: pin('B', 'end') }).bindPopup(popup(['Finish', plan.finish.query_label])).addTo(map);
-    const markers = plan.fuel_stops.map(s => L.marker([s.lat, s.lon], { icon: pin(Number(s.stop)) })
+    const markers = (plan.fuel_stops || []).map(s => L.marker([s.lat, s.lon], { icon: pin(Number(s.stop)) })
       .bindPopup(popup([
         s.stop + '. ' + s.name, s.address, s.city + ', ' + s.state, s.route_match + (s.location_precision === 'highway exit' ? '' : ' (position estimated from city)'),
         '$' + s.price_per_gallon.toFixed(3) + '/gal · ' + s.gallons_purchased.toFixed(1) + ' gal · $' + s.cost.toFixed(2),

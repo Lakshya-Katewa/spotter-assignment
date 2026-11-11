@@ -21,12 +21,22 @@ from fuel.tests.helpers import ApiFixture, fake_route
 
 class ParsingTests(SimpleTestCase):
     def test_parse_address(self):
-        self.assertEqual(exits.parse_address("I-44, EXIT 283 & US-69"), ("44", "283"))
-        self.assertEqual(exits.parse_address("I-80, EXIT 27A & US-46"), ("80", "27A"))
-        self.assertEqual(exits.parse_address("I-81, EXIT 59-A"), ("81", "59A"))
-        self.assertEqual(exits.parse_address("I-80/94, EXIT 2"), ("80", "2"))
+        self.assertEqual(exits.parse_address("I-44, EXIT 283 & US-69"), (("44",), "283"))
+        self.assertEqual(exits.parse_address("I-80, EXIT 27A & US-46"), (("80",), "27A"))
+        self.assertEqual(exits.parse_address("I-81, EXIT 59-A"), (("81",), "59A"))
+        self.assertEqual(exits.parse_address("I-80/94, EXIT 2"), (("80", "94"), "2"))
+        self.assertEqual(exits.parse_address("I-57 & I-70, EXIT 159"), (("57", "70"), "159"))
+        self.assertEqual(exits.parse_address("I-35E, EXIT 12"), (("35",), "12"))
+        self.assertEqual(exits.parse_address("I-30/US-67, EXIT 87"), (("30",), "87"))
         self.assertIsNone(exits.parse_address("US-46/US-1/US-9"))  # no interstate
         self.assertIsNone(exits.parse_address("I-35 & MAIN ST"))  # no exit number
+
+    def test_way_interstates(self):
+        self.assertEqual(exits.way_interstates("I 80;US 6"), {"80"})
+        self.assertEqual(exits.way_interstates("I 80;I 94"), {"80", "94"})
+        self.assertEqual(exits.way_interstates("I-35E"), {"35"})
+        self.assertEqual(exits.way_interstates("US 6;I 80"), {"80"})
+        self.assertEqual(exits.way_interstates("US 101"), set())
 
     def test_ref_tokens(self):
         self.assertEqual(exits.ref_tokens("27A-B"), {"27A", "27B"})
@@ -39,8 +49,8 @@ class ParsingTests(SimpleTestCase):
 class LocateTests(SimpleTestCase):
     CITY = (40.0, -100.0)
 
-    def index(self, *junctions):
-        return exits.build_index(junctions)
+    def index(self, *junctions, on=("80",)):
+        return exits.build_index((*j, frozenset(on)) if len(j) == 3 else j for j in junctions)
 
     def test_both_carriageways_average_to_the_exit(self):
         idx = self.index((40.050, -100.000, "27A"), (40.050, -100.004, "27A"))
@@ -58,9 +68,26 @@ class LocateTests(SimpleTestCase):
     def test_far_or_ambiguous_exits_keep_the_city_centroid(self):
         far = self.index((41.0, -100.0, "27"))  # ~69 miles away: a different exit 27
         self.assertEqual(exits.locate("I-80, EXIT 27", *self.CITY, far), (None, "no matching exit near the city"))
-        two = self.index((40.05, -100.0, "27"), (40.0, -100.1, "27"))  # same number on two interstates nearby
+        two = self.index((40.05, -100.0, "27"), (40.0, -100.1, "27"))  # same number twice on I-80 nearby
         self.assertEqual(exits.locate("I-80, EXIT 27", *self.CITY, two), (None, "ambiguous exit number"))
         self.assertEqual(exits.locate("MAIN ST", *self.CITY, two), (None, "no interstate exit in address"))
+
+    def test_exit_on_another_interstate_never_matches(self):
+        # Regression: the only exit 27 nearby is on I-70, so an I-80 station must not be put there.
+        other = self.index((40.05, -100.0, "27"), on=("70",))
+        self.assertEqual(exits.locate("I-80, EXIT 27", *self.CITY, other), (None, "no matching exit near the city"))
+        # With both present, only the I-80 one is used (no false ambiguity either).
+        both = self.index((40.05, -100.0, "27", frozenset({"70"})), (40.0, -100.1, "27", frozenset({"80"})))
+        (lat, lon, label), _ = exits.locate("I-80, EXIT 27", *self.CITY, both)
+        self.assertEqual((lat, lon, label), (40.0, -100.1, "I-80 exit 27"))
+
+    def test_address_naming_two_interstates(self):
+        idx = self.index((40.05, -100.0, "159", frozenset({"70"})))
+        (_, _, label), reason = exits.locate("I-57 & I-70, EXIT 159", *self.CITY, idx)
+        self.assertEqual((reason, label), ("matched", "I-70 exit 159"))
+        # A junction on concurrent interstates is one place, not two.
+        idx = self.index((40.05, -100.0, "2", frozenset({"80", "94"})))
+        self.assertEqual(exits.locate("I-80/94, EXIT 2", *self.CITY, idx)[1], "matched")
 
 
 class ExitStationOnRouteTests(ApiFixture):
@@ -99,11 +126,16 @@ class BuildCommandTests(TestCase):
         FuelStation.objects.create(opis_id=1, name="ON EXIT", address="I-80, EXIT 27A & US-46", **common)
         FuelStation.objects.create(opis_id=2, name="NO EXIT", address="US-46 & MAIN ST", **common)
         FuelStation.objects.create(opis_id=3, name="AMBIGUOUS", address="I-80, EXIT 5", **common)
+        FuelStation.objects.create(opis_id=4, name="WRONG HWY", address="I-76, EXIT 9", **common)
         overpass = {"elements": [
-            {"type": "node", "lat": 40.05, "lon": -100.000, "tags": {"ref": "27A-B"}},
-            {"type": "node", "lat": 40.05, "lon": -100.004, "tags": {"ref": "27A"}},
-            {"type": "node", "lat": 40.02, "lon": -100.0, "tags": {"ref": "5"}},
-            {"type": "node", "lat": 40.0, "lon": -100.12, "tags": {"ref": "5"}},  # same number, ~6 mi away
+            {"type": "way", "id": 100, "nodes": [1, 2, 3, 4], "tags": {"ref": "I 80;US 6"}},
+            {"type": "way", "id": 101, "nodes": [5], "tags": {"ref": "I 70"}},
+            {"type": "node", "id": 1, "lat": 40.05, "lon": -100.000, "tags": {"ref": "27A-B"}},
+            {"type": "node", "id": 2, "lat": 40.05, "lon": -100.004, "tags": {"ref": "27A"}},
+            {"type": "node", "id": 3, "lat": 40.02, "lon": -100.0, "tags": {"ref": "5"}},
+            {"type": "node", "id": 4, "lat": 40.0, "lon": -100.12, "tags": {"ref": "5"}},  # same number, ~6 mi away
+            {"type": "node", "id": 5, "lat": 40.03, "lon": -100.0, "tags": {"ref": "9"}},  # exit 9, but on I-70
+            {"type": "node", "id": 6, "lat": 40.03, "lon": -100.0, "tags": {"ref": "9"}},  # on no interstate way
         ]}
         with tempfile.TemporaryDirectory() as tmp:
             source, output = Path(tmp) / "junctions.json", Path(tmp) / "exit_locations.json"

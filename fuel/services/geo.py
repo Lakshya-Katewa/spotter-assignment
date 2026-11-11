@@ -178,7 +178,7 @@ def _from_nominatim(query):
             hits = r.json()
         except (requests.RequestException, ValueError) as exc:
             logger.warning("Nominatim request failed: %s", exc)
-            raise GeocoderUnavailable(f"Could not geocode '{query}': {exc}") from exc
+            raise GeocoderUnavailable(f"Could not geocode '{query}': the geocoding service is unavailable.") from exc
         try:
             return parse_nominatim(hits, query)
         except GeocoderBadResponse:

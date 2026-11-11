@@ -47,7 +47,6 @@ class ApiTests(ApiFixture):
         # Default: start empty and pay for every gallon; the ~3.5 mi to the first station
         # are billed at its price.
         self.assertTrue(s["starting_fuel_billed"])
-        self.assertEqual(data["meta"]["warnings"], [])
         self.assertAlmostEqual(s["fuel_paid_for_gallons"], s["fuel_consumed_gallons"], places=1)
         self.assertAlmostEqual(s["starting_fuel_cost"], s["starting_fuel_gallons"] * stops["START STOP"]["price_per_gallon"], places=2)
         self.assertAlmostEqual(s["total_fuel_cost"], s["starting_fuel_cost"] + sum(x["cost"] for x in data["fuel_stops"]), places=1)
@@ -230,3 +229,51 @@ class FewerStopsAlternativeTests(ApiFixture):
     @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
     def test_no_alternative_when_already_consolidating(self, _):
         self.assertIsNone(self.get(min_stop_savings=5).json()["summary"]["fewer_stops_alternative"])
+
+
+def _route_without_stations(*_args, **_kwargs):
+    # 70 miles along -90W, far from every fixture station.
+    return routing.Route(
+        distance_miles=70.0, duration_seconds=4000,
+        coordinates=[[-90.0, 35.0], [-90.0, 36.0]], highways=[(0.0, 70.0, frozenset({"I55"}))],
+    )
+
+
+class CoverageGapTests(ApiFixture):
+    """No usable station: a 422 with a reason code, but still the route and its map."""
+
+    @mock.patch("fuel.services.routing.get_route", side_effect=_route_without_stations)
+    def test_no_stations_returns_route_and_map(self, _):
+        r = self.client.get("/api/route/", {"start": "35,-90", "finish": "36,-90"})
+        self.assertEqual(r.status_code, 422)
+        body = r.json()
+        self.assertEqual(body["code"], "no_stations_on_route")
+        self.assertIn("start_fuel_gallons", body["error"])
+        self.assertEqual(body["route"]["distance_miles"], 70.0)
+        self.assertEqual(body["route"]["geometry"]["type"], "LineString")
+        self.assertIn("/map/?", body["map_url"])
+        self.assertIn("lat", body["start"])
+        page = self.client.get("/map/", {"start": "35,-90", "finish": "36,-90"})
+        self.assertEqual(page.status_code, 422)
+        self.assertContains(page, '"distance_miles": 70.0', status_code=422)  # route drawn without a plan
+
+    @mock.patch("fuel.services.routing.get_route", side_effect=_route_without_stations)
+    def test_full_tank_covers_a_short_trip_without_stations(self, _):
+        r = self.client.get("/api/route/", {"start": "35,-90", "finish": "36,-90", "start_fuel_gallons": 50})
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.json()["fuel_stops"], [])
+        self.assertEqual(r.json()["summary"]["total_fuel_cost"], 0)
+
+
+class HealthTests(ApiFixture):
+    def test_healthz(self):
+        r = self.client.get("/healthz")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["status"], "ok")
+        self.assertGreater(r.json()["stations"], 0)
+
+    def test_healthz_without_data(self):
+        FuelStation.objects.all().delete()
+        DatasetVersion.objects.filter(pk=1).update(version="empty")
+        reset_index()
+        self.assertEqual(self.client.get("/healthz").status_code, 503)

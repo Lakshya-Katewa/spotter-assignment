@@ -110,7 +110,7 @@ def _fetch(start_lat, start_lon, end_lat, end_lon):
         data = r.json()
     except (requests.RequestException, ValueError) as exc:
         logger.warning("OSRM request failed: %s", exc)
-        return _Failure(f"Routing service unavailable: {exc}", 502)
+        return _Failure("Routing service unavailable; please retry later.", 502)  # details are logged, not returned
     try:
         route = parse_osrm(r.status_code, data)
     except RoutingError as exc:

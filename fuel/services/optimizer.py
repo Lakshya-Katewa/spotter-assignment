@@ -17,9 +17,18 @@ EPS = 1e-9
 
 
 class NoFeasiblePlan(ValueError):
-    def __init__(self, message, gap_start_mile=None):
+    """No plan exists. `code` says why, for API clients:
+
+    no_stations_on_route   the price data has no usable station along the route
+    no_station_near_start  pay-for-all-fuel start, but no station within the approach distance
+    start_fuel_too_low     the given starting fuel can't reach any station
+    range_gap              two consecutive stations (or the last one and the finish) are out of range
+    """
+
+    def __init__(self, message, gap_start_mile=None, code="range_gap"):
         super().__init__(message)
         self.gap_start_mile = gap_start_mile
+        self.code = code
 
 
 @dataclass
@@ -46,11 +55,12 @@ def plan_fuel_stops(stations, total_miles, max_range_miles, mpg, start_fuel_gall
     """
     stations: iterable of (key, mile, price). Only stations with 0 <= mile <= total_miles are used.
     start_fuel_gallons: fuel already in the tank at mile 0, not paid for on this trip.
-        None (the default) means the vehicle starts empty and pays for every gallon it
-        burns. The price file has no station exactly at the start, so the first purchase
-        may be at any station within `approach_miles`, and the fuel driven to get there is
-        billed at that station's price. Each such first station is tried and the cheapest
-        whole-trip plan wins. If none is that close, the first station on the route is used.
+        None (the default) means "pay for all fuel": the trip pays for every gallon it
+        burns. The price file has no station exactly at the start, so the vehicle is
+        assumed to start with just enough fuel to reach its first stop, which may be any
+        station within `approach_miles`; that fuel is charged at the first stop's price.
+        Each such first stop is tried and the cheapest whole-trip plan wins. With no
+        station that close, there is no plan (the estimate would no longer be honest).
     Every purchase fits in the tank: fuel on arrival + gallons bought <= tank size.
     Returns a Plan, or raises NoFeasiblePlan if some gap is longer than the range.
     """
@@ -76,18 +86,18 @@ def plan_fuel_stops(stations, total_miles, max_range_miles, mpg, start_fuel_gall
     pts = sorted(best_at.values(), key=lambda s: s[1])
 
     if billed_start:
-        if not pts:
-            raise NoFeasiblePlan("The price file has no fuel station along this route.", 0.0)
-        if pts[0][1] > max_range_miles + EPS:
-            raise NoFeasiblePlan(
-                f"The first fuel station on the route is at mile {pts[0][1]:.0f}, beyond the "
-                f"{max_range_miles:.0f}-mile range.",
-                0.0,
-            )
         # A first stop must be before the destination (buying there buys nothing).
-        firsts = [j for j, p in enumerate(pts) if p[1] < total_miles - EPS and p[1] <= max(approach_miles, pts[0][1]) + EPS]
+        before_end = [j for j, p in enumerate(pts) if p[1] < total_miles - EPS]
+        if not before_end:
+            raise NoFeasiblePlan("The price file has no fuel station along this route.", 0.0, "no_stations_on_route")
+        firsts = [j for j in before_end if pts[j][1] <= approach_miles + EPS]
         if not firsts:
-            raise NoFeasiblePlan("The price file has no fuel station along this route before the destination.", 0.0)
+            raise NoFeasiblePlan(
+                f"The price file has no fuel station within {approach_miles:g} miles of the start "
+                f"(the first one on the route is at mile {pts[before_end[0]][1]:.0f}).",
+                0.0,
+                "no_station_near_start",
+            )
         best, last_err = None, None
         for j in firsts:
             try:
@@ -125,6 +135,7 @@ def _plan_from(pts, total_miles, max_range_miles, mpg, start_miles, billed_price
             f"No fuel station within {start_miles:.0f} miles of the start, the range of the "
             f"{start_miles / mpg:g} gallons in the tank (nearest: {first}).",
             0.0,
+            "start_fuel_too_low" if pts else "no_stations_on_route",
         )
     # The start acts as a station we can't buy at, so every station is "cheaper":
     # the greedy rule says go to the first one.

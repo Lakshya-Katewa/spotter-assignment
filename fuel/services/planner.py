@@ -15,11 +15,17 @@ from fuel.services.stations import DatasetChanging, get_index
 
 
 class PlanError(ValueError):
-    """Bad input (400), an impossible trip (422) or an unavailable upstream (502/503)."""
+    """Bad input (400), an impossible trip (422) or an unavailable upstream (502/503).
 
-    def __init__(self, message, status=400):
+    `code` is a stable machine-readable reason for 422s; `partial` carries what could
+    still be computed (the route), so clients can show the map even without a plan.
+    """
+
+    def __init__(self, message, status=400, code=None, partial=None):
         super().__init__(message)
         self.status = status
+        self.code = code
+        self.partial = partial
 
 
 def build_plan(
@@ -35,7 +41,9 @@ def build_plan(
     if not math.isfinite(min_stop_savings) or min_stop_savings < 0:
         raise PlanError("min_stop_savings must be a number >= 0.")
     tank = settings.VEHICLE_MAX_RANGE_MILES / settings.VEHICLE_MPG
-    # None = start empty and pay for all the fuel the trip burns (see plan_fuel_stops).
+    if start_fuel_gallons is None:
+        start_fuel_gallons = settings.DEFAULT_START_FUEL_GALLONS
+    # None = pay for all the fuel the trip burns (see plan_fuel_stops).
     if start_fuel_gallons is not None and not (math.isfinite(start_fuel_gallons) and 0 <= start_fuel_gallons <= tank):
         raise PlanError(f"start_fuel_gallons must be between 0 and {tank:g}.")
 
@@ -53,7 +61,14 @@ def build_plan(
     result = cache.get(cache_key)
     cached = result is not None
     if not cached:
-        result = _compute(a, b, min_stop_savings, start_fuel_gallons, index)
+        try:
+            result = _compute(a, b, min_stop_savings, start_fuel_gallons, index)
+        except PlanError as exc:
+            if exc.partial:
+                exc.partial.update(start=a.as_dict(), finish=b.as_dict())
+                if not include_geometry:
+                    exc.partial["route"].pop("geometry", None)
+            raise
         cache.set(cache_key, result, settings.ROUTE_CACHE_SECONDS)
 
     out = dict(result)
@@ -97,6 +112,17 @@ def _route_match(c, info, route_highways, near_route, exit_near_route, window):
     return None
 
 
+def _route_json(route) -> dict:
+    return {
+        "distance_miles": round(route.distance_miles, 1),
+        "duration_hours": round(route.duration_seconds / 3600, 2),
+        "geometry": {
+            "type": "LineString",
+            "coordinates": [[round(x, 5), round(y, 5)] for x, y in simplify(route.coordinates)],
+        },
+    }
+
+
 def _compute(a, b, min_stop_savings, start_fuel_gallons, index) -> dict:
     try:
         route = routing.get_route(a.lat, a.lon, b.lat, b.lon)
@@ -134,12 +160,12 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, index) -> dict:
         )
     except NoFeasiblePlan as exc:
         hint = ""
-        if start_fuel_gallons is None and exc.gap_start_mile == 0:
+        if start_fuel_gallons is None and exc.code in ("no_stations_on_route", "no_station_near_start"):
             hint = (
                 " If the vehicle departs with fuel in the tank, pass start_fuel_gallons "
                 f"(up to {tank:g}; a full tank covers {max_range:g} miles)."
             )
-        raise PlanError(str(exc) + hint, 422) from exc
+        raise PlanError(str(exc) + hint, 422, code=exc.code, partial={"route": _route_json(route)}) from exc
     plan = consolidate_stops(copy.deepcopy(cheapest), mpg, tank, min_stop_savings)
     # The cheapest plan often includes tiny top-ups (cents of savings each). Report what
     # a practical threshold would give, so the trade-off is visible without asking.
@@ -180,36 +206,22 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, index) -> dict:
             }
         )
 
-    warnings = []
     billed_start = start_fuel_gallons is None
     paid_gallons = plan.total_gallons + (plan.start_fuel_gallons if billed_start else 0.0)
     avg = plan.total_cost / paid_gallons if paid_gallons else 0.0
     if billed_start:
         start_mode = (
-            "empty (default): every gallon the trip burns is paid for. The fuel to reach the first "
-            "station on the route is billed at that station's price. Pass start_fuel_gallons for "
-            "fuel already in the tank."
+            "pay for all fuel (default): the vehicle starts with just enough fuel to reach its first "
+            f"stop (within {settings.START_APPROACH_MILES:g} miles), and that fuel is charged at the "
+            "first stop's price. Pass start_fuel_gallons for fuel already in the tank (not charged)."
         )
         cost_note = "all fuel the trip burns (distance / mpg), at the prices of the planned stops"
-        approach = plan.start_fuel_gallons * mpg
-        if approach > settings.START_APPROACH_MILES:
-            warnings.append(
-                f"The nearest station on the route is {approach:.0f} miles from the start; the fuel to "
-                "reach it is billed at its price, which is a rougher estimate than usual."
-            )
     else:
         start_mode = f"{start_fuel_gallons:g} gallons already in the tank (given by the caller; not paid for on this trip)"
         cost_note = "fuel purchased during the trip; the fuel already in the tank at the start is not included"
 
     return {
-        "route": {
-            "distance_miles": round(route.distance_miles, 1),
-            "duration_hours": round(route.duration_seconds / 3600, 2),
-            "geometry": {
-                "type": "LineString",
-                "coordinates": [[round(x, 5), round(y, 5)] for x, y in simplify(route.coordinates)],
-            },
-        },
+        "route": _route_json(route),
         "fuel_stops": stops,
         "summary": {
             "total_fuel_cost": round(plan.total_cost, 2),
@@ -246,10 +258,11 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, index) -> dict:
                     "feasibility are estimates (city-centre stops more so)."
                 ),
             },
-            "warnings": warnings,
             "min_stop_savings": min_stop_savings,
             "station_dataset_version": index.version,
             "routing_provider": settings.OSRM_URL,
+            "attribution": "Routes and interstate exit positions: (c) OpenStreetMap contributors, ODbL. "
+                           "Places: US Census Bureau.",
             "routing_calls": 0 if route.from_cache else 1,
         },
     }
