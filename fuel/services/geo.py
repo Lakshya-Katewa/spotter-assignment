@@ -22,7 +22,7 @@ from django.conf import settings
 from django.core.cache import cache
 
 from fuel.models import Place
-from fuel.services import boundary
+from fuel.services import boundary, singleflight
 from fuel.services.names import CANADIAN_PROVINCES, place_key
 
 EARTH_RADIUS_MI = 3958.7613
@@ -129,19 +129,28 @@ _rate_lock = threading.Lock()
 _RATE_KEY = "nominatim:slot"
 
 
-def _acquire_rate_slot():
-    """Wait for permission to make one Nominatim request (max 1 per second).
+class GeocoderBadResponse(GeocoderUnavailable):
+    status = 502
 
-    `cache.add` is atomic, so with a shared cache (Redis/Memcached) the limit
-    holds across all worker processes; with the default in-process cache it
-    holds per process. Gives up after GEOCODE_MAX_WAIT_SECONDS.
+
+def _acquire_rate_slot(deadline):
+    """Reserve one Nominatim request slot (max 1 per second) before `deadline`.
+
+    `cache.add` is atomic, so with a shared cache (Redis) the limit holds across
+    all worker processes; with the default in-process cache it holds per process.
+    The whole wait, including queueing behind other threads, is bounded.
     """
-    deadline = time.monotonic() + settings.GEOCODE_MAX_WAIT_SECONDS
-    with _rate_lock:
-        while not cache.add(_RATE_KEY, 1, timeout=1):
+    if not _rate_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        raise GeocoderUnavailable("Geocoder is busy; please retry in a moment.")
+    try:
+        while True:
             if time.monotonic() >= deadline:
                 raise GeocoderUnavailable("Geocoder is busy; please retry in a moment.")
-            time.sleep(0.05)
+            if cache.add(_RATE_KEY, 1, timeout=1):
+                return
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    finally:
+        _rate_lock.release()
 
 
 def _cache_key(query):
@@ -149,29 +158,53 @@ def _cache_key(query):
     return "geocode:" + hashlib.sha1(normalized.encode()).hexdigest()  # safe for any cache backend
 
 
+def parse_nominatim(hits, query):
+    """{} for "no result", {lat, lon, label} for a hit; GeocoderBadResponse if malformed."""
+    if not isinstance(hits, list):
+        raise GeocoderBadResponse(f"Could not geocode '{query}': malformed geocoder response.")
+    if not hits:
+        return {}
+    hit = hits[0]
+    try:
+        lat, lon = float(hit["lat"]), float(hit["lon"])
+    except (TypeError, KeyError, ValueError):
+        raise GeocoderBadResponse(f"Could not geocode '{query}': malformed geocoder response.") from None
+    if not (math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
+        raise GeocoderBadResponse(f"Could not geocode '{query}': geocoder returned invalid coordinates.")
+    label = hit.get("display_name")
+    return {"lat": lat, "lon": lon, "label": label if isinstance(label, str) and label else query}
+
+
 def _from_nominatim(query):
     key = _cache_key(query)
-    hit = cache.get(key)
-    if hit is not None:
-        if not hit:
-            raise LocationError(f"Could not find '{query}' in the USA.")
-        return Location(hit["lat"], hit["lon"], hit["label"], "nominatim-cache")
+    deadline = time.monotonic() + settings.GEOCODE_MAX_WAIT_SECONDS
 
-    _acquire_rate_slot()
+    def lookup():
+        _acquire_rate_slot(deadline)
+        try:
+            r = requests.get(
+                settings.NOMINATIM_URL,
+                params={"q": query, "countrycodes": "us", "format": "json", "limit": 1},
+                headers={"User-Agent": settings.HTTP_USER_AGENT},
+                timeout=settings.EXTERNAL_TIMEOUT,
+            )
+            r.raise_for_status()
+            hits = r.json()
+        except (requests.RequestException, ValueError) as exc:
+            raise GeocoderUnavailable(f"Could not geocode '{query}': {exc}") from exc
+        return parse_nominatim(hits, query)
+
+    # Identical concurrent lookups share one request; waiting re-checks the cache.
     try:
-        r = requests.get(
-            settings.NOMINATIM_URL,
-            params={"q": query, "countrycodes": "us", "format": "json", "limit": 1},
-            headers={"User-Agent": settings.HTTP_USER_AGENT},
-            timeout=settings.EXTERNAL_TIMEOUT,
+        best, cached = singleflight.get_or_compute(
+            key,
+            lookup,
+            ttl=lambda v: settings.GEOCODE_CACHE_SECONDS if v else settings.GEOCODE_NEGATIVE_CACHE_SECONDS,
+            lock_seconds=settings.EXTERNAL_TIMEOUT + settings.GEOCODE_MAX_WAIT_SECONDS,
+            wait_seconds=settings.GEOCODE_MAX_WAIT_SECONDS + settings.EXTERNAL_TIMEOUT,
         )
-        r.raise_for_status()
-        hits = r.json()
-    except (requests.RequestException, ValueError) as exc:
-        raise GeocoderUnavailable(f"Could not geocode '{query}': {exc}") from exc
-    if not hits:
-        cache.set(key, {}, settings.GEOCODE_NEGATIVE_CACHE_SECONDS)
+    except singleflight.Busy:
+        raise GeocoderUnavailable("Geocoder is busy; please retry in a moment.") from None
+    if not best:
         raise LocationError(f"Could not find '{query}' in the USA.")
-    best = {"lat": float(hits[0]["lat"]), "lon": float(hits[0]["lon"]), "label": hits[0].get("display_name", query)}
-    cache.set(key, best, settings.GEOCODE_CACHE_SECONDS)
-    return Location(best["lat"], best["lon"], best["label"], "nominatim")
+    return Location(best["lat"], best["lon"], best["label"], "nominatim-cache" if cached else "nominatim")

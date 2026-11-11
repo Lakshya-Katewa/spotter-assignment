@@ -149,19 +149,27 @@ VEHICLE_MPG = float(os.getenv("VEHICLE_MPG", "10"))
 # centroid is within STATION_NEAR_ROUTE_MILES of the route.
 STATION_CORRIDOR_MILES = float(os.getenv("STATION_CORRIDOR_MILES", "15"))
 STATION_NEAR_ROUTE_MILES = float(os.getenv("STATION_NEAR_ROUTE_MILES", "2"))
-# Default start ("nearly empty"): the first fill-up must be within this many route miles.
-ORIGIN_STATION_WINDOW_MILES = float(os.getenv("ORIGIN_STATION_WINDOW_MILES", "30"))
+# Fuel in the tank at the start unless the caller passes start_fuel_gallons.
+# Fixed (not derived from the plan) so costs of different plans are comparable.
+# 3 gallons = 30 miles: enough to reach a station near the start.
+DEFAULT_START_FUEL_GALLONS = float(os.getenv("DEFAULT_START_FUEL_GALLONS", "3"))
 # Skip a fuel stop when it saves less than this many dollars (0 = strictly cheapest plan).
 MIN_STOP_SAVINGS = float(os.getenv("MIN_STOP_SAVINGS", "0"))
 ROUTE_CACHE_SECONDS = int(os.getenv("ROUTE_CACHE_SECONDS", str(24 * 3600)))
 
-CACHES = {
-    "default": {
-        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-        "LOCATION": "fuel-route-planner",
-        "OPTIONS": {"MAX_ENTRIES": 2000},
+# Default: in-process cache (zero setup; fine for one process). Set REDIS_URL to share the
+# route/plan/geocode caches, the request coalescing locks and the Nominatim rate limit
+# across all worker processes (needs `pip install redis`).
+if os.getenv("REDIS_URL"):
+    CACHES = {"default": {"BACKEND": "django.core.cache.backends.redis.RedisCache", "LOCATION": os.environ["REDIS_URL"]}}
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "fuel-route-planner",
+            "OPTIONS": {"MAX_ENTRIES": 2000},
+        }
     }
-}
 
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer", "rest_framework.renderers.BrowsableAPIRenderer"],

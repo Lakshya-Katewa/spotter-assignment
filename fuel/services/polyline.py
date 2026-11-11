@@ -4,7 +4,12 @@ import numpy as np
 
 
 def decode(encoded: str, precision: int = 5) -> list:
-    """Decode an encoded polyline to [[lon, lat], ...] (GeoJSON order)."""
+    """Decode an encoded polyline to [[lon, lat], ...] (GeoJSON order).
+
+    Raises ValueError for truncated or invalid input.
+    """
+    if not isinstance(encoded, str):
+        raise ValueError("polyline must be a string")
     coords, index, lat, lon = [], 0, 0, 0
     factor = 10**precision
     length = len(encoded)
@@ -13,7 +18,11 @@ def decode(encoded: str, precision: int = 5) -> list:
         for _ in range(2):
             result, shift = 0, 0
             while True:
+                if index >= length:
+                    raise ValueError("truncated polyline")
                 b = ord(encoded[index]) - 63
+                if not 0 <= b < 64:
+                    raise ValueError("invalid polyline character")
                 index += 1
                 result |= (b & 0x1F) << shift
                 shift += 5

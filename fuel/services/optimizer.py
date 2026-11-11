@@ -41,21 +41,25 @@ class Plan:
     end_fuel_gallons: float = 0.0  # left in the tank on arrival
 
 
-def plan_fuel_stops(stations, total_miles, max_range_miles, mpg, start_fuel_gallons=None, origin_window_miles=0.0):
+def plan_fuel_stops(stations, total_miles, max_range_miles, mpg, start_fuel_gallons=0.0):
     """
     stations: iterable of (key, mile, price). Only stations with 0 <= mile <= total_miles are used.
-    start_fuel_gallons: fuel in the tank at the start, already paid for.
-        None means "nearly empty": the vehicle has just enough fuel to reach a
-        station within `origin_window_miles` (the cheapest one there is chosen).
-        That starting fuel is reported in `start_fuel_gallons`, never as a purchase.
+    start_fuel_gallons: fuel in the tank at mile 0. It is a fixed input, independent
+        of which stations are chosen, and is not counted as a purchase.
     Every purchase fits in the tank: fuel on arrival + gallons bought <= tank size.
     Returns a Plan, or raises NoFeasiblePlan if some gap is longer than the range.
     """
     if max_range_miles <= 0 or mpg <= 0:
         raise ValueError("max_range_miles and mpg must be positive")
     tank = max_range_miles / mpg
-    if start_fuel_gallons is not None and not (0 <= start_fuel_gallons <= tank + EPS):
+    if not (0 <= start_fuel_gallons <= tank + EPS):
         raise ValueError(f"start_fuel_gallons must be between 0 and {tank:g}")
+    if total_miles < 0:
+        raise ValueError("total_miles must be >= 0")
+
+    start_miles = start_fuel_gallons * mpg
+    if start_miles + EPS >= total_miles:  # includes zero-distance trips: nothing to buy
+        return Plan(start_fuel_gallons=start_fuel_gallons, end_fuel_gallons=max(0.0, start_miles - total_miles) / mpg)
 
     # Keep the cheapest station at each mile marker; sort by position.
     best_at = {}
@@ -66,25 +70,17 @@ def plan_fuel_stops(stations, total_miles, max_range_miles, mpg, start_fuel_gall
                 best_at[m] = (key, m, float(price))
     pts = sorted(best_at.values(), key=lambda s: s[1])
 
-    if start_fuel_gallons is None:
-        reachable = [k for k, s in enumerate(pts) if s[1] <= origin_window_miles + EPS]
-        reach = origin_window_miles
-        if reachable:
-            i = min(reachable, key=lambda k: (pts[k][2], pts[k][1]))
-            start_miles = pts[i][1]  # exactly enough to get there
-    else:
-        start_miles = start_fuel_gallons * mpg
-        reach = start_miles
-        if start_miles + EPS >= total_miles:  # no fuel needed
-            return Plan(start_fuel_gallons=start_fuel_gallons, end_fuel_gallons=(start_miles - total_miles) / mpg)
-        reachable = [k for k, s in enumerate(pts) if s[1] <= start_miles + EPS]
-        if reachable:
-            # The start acts as a station we can't buy at, so every station is
-            # "cheaper": the greedy rule says go to the first one.
-            i = reachable[0]
+    reachable = [k for k, s in enumerate(pts) if s[1] <= start_miles + EPS]
     if not reachable:
-        first = pts[0][1] if pts else total_miles
-        raise NoFeasiblePlan(f"No fuel station within {reach:.0f} miles of the start (nearest at mile {first:.0f}).", 0.0)
+        first = f"mile {pts[0][1]:.0f}" if pts else "none on the route"
+        raise NoFeasiblePlan(
+            f"No fuel station within {start_miles:.0f} miles of the start, the range of the "
+            f"{start_fuel_gallons:g} gallons in the tank (nearest: {first}).",
+            0.0,
+        )
+    # The start acts as a station we can't buy at, so every station is "cheaper":
+    # the greedy rule says go to the first one.
+    i = reachable[0]
 
     plan = Plan(start_fuel_gallons=start_miles / mpg)
     fuel = start_miles - pts[i][1]  # range left on arrival (miles)

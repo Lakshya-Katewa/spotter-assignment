@@ -8,11 +8,10 @@ import time
 from django.conf import settings
 from django.core.cache import cache
 
-from fuel.models import DatasetVersion, FuelStation
 from fuel.services import geo, highways, routing
 from fuel.services.optimizer import NoFeasiblePlan, consolidate_stops, plan_fuel_stops
 from fuel.services.polyline import simplify
-from fuel.services.stations import get_index
+from fuel.services.stations import DatasetChanging, get_index
 
 
 class PlanError(ValueError):
@@ -36,7 +35,10 @@ def build_plan(
     if not math.isfinite(min_stop_savings) or min_stop_savings < 0:
         raise PlanError("min_stop_savings must be a number >= 0.")
     tank = settings.VEHICLE_MAX_RANGE_MILES / settings.VEHICLE_MPG
-    if start_fuel_gallons is not None and not (math.isfinite(start_fuel_gallons) and 0 <= start_fuel_gallons <= tank):
+    start_given = start_fuel_gallons is not None
+    if not start_given:
+        start_fuel_gallons = settings.DEFAULT_START_FUEL_GALLONS
+    if not (math.isfinite(start_fuel_gallons) and 0 <= start_fuel_gallons <= tank):
         raise PlanError(f"start_fuel_gallons must be between 0 and {tank:g}.")
 
     try:
@@ -44,13 +46,16 @@ def build_plan(
     except geo.LocationError as exc:
         raise PlanError(str(exc), exc.status) from exc
 
-    version = DatasetVersion.current()
-    key_src = f"{version}|{a.lat:.5f},{a.lon:.5f}|{b.lat:.5f},{b.lon:.5f}|{min_stop_savings:g}|{start_fuel_gallons}"
+    try:
+        index = get_index()  # one consistent snapshot for the whole request
+    except DatasetChanging as exc:
+        raise PlanError(str(exc), 503) from exc
+    key_src = f"{index.version}|{a.lat:.5f},{a.lon:.5f}|{b.lat:.5f},{b.lon:.5f}|{min_stop_savings:g}|{start_fuel_gallons}"
     cache_key = "plan:" + hashlib.sha1(key_src.encode()).hexdigest()
     result = cache.get(cache_key)
     cached = result is not None
     if not cached:
-        result = _compute(a, b, min_stop_savings, start_fuel_gallons, version)
+        result = _compute(a, b, min_stop_savings, start_fuel_gallons, start_given, index)
         cache.set(cache_key, result, settings.ROUTE_CACHE_SECONDS)
 
     out = dict(result)
@@ -71,22 +76,24 @@ def build_plan(
     return out
 
 
-def _accept(c, route_highways, near_route, window):
-    """Is a station near the route actually usable from it?
+def _route_match(c, route_highways, near_route, window):
+    """Evidence (not proof) that a station near the route can be used from it.
 
-    * its address names a highway the route drives near that point -> it's at an exit; or
-    * its (centroid) position is within `near_route` miles of the route line.
+    * its address names a highway the route drives near that point (likely an exit
+      of the road we're on; exit, direction and detour are not verified); or
+    * its city centroid is within `near_route` miles of the route line.
+    Returns a description of the evidence, or None to reject the station.
     """
     if c.highways:
         shared = c.highways & highways.refs_near(route_highways, c.mile, window)
         if shared:
-            return "on " + ", ".join(sorted(shared))
+            return f"address names {', '.join(sorted(shared))}, which the route uses nearby"
     if c.offset_miles <= near_route:
-        return "near route"
+        return f"city centre within {near_route:g} mi of the route"
     return None
 
 
-def _compute(a, b, min_stop_savings, start_fuel_gallons, version) -> dict:
+def _compute(a, b, min_stop_savings, start_fuel_gallons, start_given, index) -> dict:
     try:
         route = routing.get_route(a.lat, a.lon, b.lat, b.lon)
     except routing.RoutingError as exc:
@@ -97,20 +104,19 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, version) -> dict:
     tank = max_range / mpg
     corridor = settings.STATION_CORRIDOR_MILES
     near_route = settings.STATION_NEAR_ROUTE_MILES
-    origin_window = settings.ORIGIN_STATION_WINDOW_MILES
 
     # Scale geometry miles to the router's official distance so mile markers line up
     # with the step distances used for highway matching.
-    found, cum = get_index(version).along_route(route.coordinates, corridor)
+    found, cum = index.along_route(route.coordinates, corridor)
     geom_miles = float(cum[-1]) if len(cum) else 0.0
     scale = route.distance_miles / geom_miles if geom_miles else 1.0
-    candidates, access = [], {}
+    candidates, matches = [], {}
     for c in found:
         c.mile *= scale
-        how = _accept(c, route.highways or [], near_route, corridor)
+        how = _route_match(c, route.highways or [], near_route, corridor)
         if how:
             candidates.append(c)
-            access[c.station_id] = how
+            matches[c.station_id] = how
 
     try:
         cheapest = plan_fuel_stops(
@@ -119,17 +125,16 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, version) -> dict:
             max_range_miles=max_range,
             mpg=mpg,
             start_fuel_gallons=start_fuel_gallons,
-            origin_window_miles=origin_window,
         )
     except NoFeasiblePlan as exc:
-        raise PlanError(str(exc), 422) from exc
+        hint = "" if start_given else " Pass start_fuel_gallons if the vehicle starts with more fuel."
+        raise PlanError(str(exc) + hint, 422) from exc
     plan = consolidate_stops(copy.deepcopy(cheapest), mpg, tank, min_stop_savings)
 
-    info = {s.opis_id: s for s in FuelStation.objects.filter(opis_id__in=[s.key for s in plan.stops])}
     offsets = {c.station_id: c.offset_miles for c in candidates}
     stops = []
     for n, s in enumerate(plan.stops, start=1):
-        st = info[s.key]
+        st = index.info[s.key]  # same snapshot the plan was computed from
         stops.append(
             {
                 "stop": n,
@@ -142,7 +147,7 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, version) -> dict:
                 "lon": round(st.lon, 6),
                 "price_per_gallon": round(s.price, 4),
                 "mile_marker": round(s.mile, 1),
-                "access": access[s.key],
+                "route_match": matches[s.key],
                 "city_centroid_distance_from_route_miles": round(offsets.get(s.key, 0.0), 1),
                 "fuel_on_arrival_gallons": round(s.fuel_on_arrival_gal, 2),
                 "gallons_purchased": round(s.gallons, 2),
@@ -152,9 +157,9 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, version) -> dict:
 
     avg = plan.total_cost / plan.total_gallons if plan.total_gallons else 0.0
     start_mode = (
-        f"{start_fuel_gallons:g} gallons (given)"
-        if start_fuel_gallons is not None
-        else f"nearly empty: just enough to reach the first station, within {origin_window:g} miles"
+        f"{start_fuel_gallons:g} gallons (given by the caller)"
+        if start_given
+        else f"{start_fuel_gallons:g} gallons (default; pass start_fuel_gallons to change)"
     )
     return {
         "route": {
@@ -186,14 +191,17 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, version) -> dict:
                 "miles_per_gallon": mpg,
                 "tank_gallons": tank,
                 "starting_fuel": start_mode,
+                "total_fuel_cost": "money spent on fuel purchased during the trip; the starting fuel is not included",
                 "station_location": (
-                    "city centroid (the price file has no coordinates); a station counts as on the "
-                    "route if its address names a highway the route uses nearby, or its city is within "
-                    f"{near_route:g} miles of the route. Mile markers and costs are estimates."
+                    "city centroid (the price file has no coordinates). A station is used if its address "
+                    "names a highway the route uses nearby, or its city is within "
+                    f"{near_route:g} miles of the route. This is evidence, not verification: the exact exit, "
+                    "access direction and detour are unknown, so mile markers, costs and range feasibility "
+                    "are estimates."
                 ),
             },
             "min_stop_savings": min_stop_savings,
-            "station_dataset_version": version,
+            "station_dataset_version": index.version,
             "routing_provider": settings.OSRM_URL,
             "routing_calls": 0 if route.from_cache else 1,
         },

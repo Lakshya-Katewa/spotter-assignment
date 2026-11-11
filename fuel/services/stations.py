@@ -12,6 +12,8 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.spatial import cKDTree
 
+from django.db import transaction
+
 from fuel.models import DatasetVersion, FuelStation
 from fuel.services import highways
 from fuel.services.geo import EARTH_RADIUS_MI
@@ -45,7 +47,25 @@ class Candidate:
     highways: frozenset  # I-/US- highways named in the station's address
 
 
+FIELDS = ("opis_id", "lat", "lon", "price", "address", "name", "city", "state")
+
+
+@dataclass(frozen=True)
+class StationInfo:
+    opis_id: int
+    name: str
+    address: str
+    city: str
+    state: str
+    lat: float
+    lon: float
+    price: float
+
+
 class StationIndex:
+    """An immutable snapshot of one dataset version: geometry, prices and the
+    details needed for responses all come from the same rows."""
+
     def __init__(self, rows, version="none"):
         self.version = version
         self.ids = np.array([r[0] for r in rows], dtype=np.int64)
@@ -53,6 +73,11 @@ class StationIndex:
         self.lon = np.array([r[2] for r in rows], dtype=float)
         self.price = np.array([float(r[3]) for r in rows], dtype=float)
         self.highways = [highways.from_address(r[4]) for r in rows]
+        self.info = {
+            r[0]: StationInfo(opis_id=r[0], name=r[5], address=r[4], city=r[6], state=r[7],
+                              lat=float(r[1]), lon=float(r[2]), price=float(r[3]))
+            for r in rows
+        }
         self.tree = cKDTree(_to_xyz(self.lat, self.lon)) if rows else None
 
     def __len__(self):
@@ -114,14 +139,35 @@ def densify(coordinates, step_miles=1.0):
     return pts, cum
 
 
-def get_index(version: str | None = None) -> StationIndex:
-    """The station index for the current dataset version (rebuilt if it changed)."""
+class DatasetChanging(RuntimeError):
+    """The dataset kept changing while we tried to read a consistent snapshot."""
+
+
+def _read_snapshot(attempts=5):
+    """Rows and the version they belong to.
+
+    `load_stations` replaces rows and version in one transaction. We read the
+    version before and after the rows (inside a transaction too) and retry if it
+    moved, so a snapshot never mixes two loads, whatever the isolation level.
+    """
+    for _ in range(attempts):
+        with transaction.atomic():
+            before = DatasetVersion.current()
+            rows = list(FuelStation.objects.values_list(*FIELDS))
+            after = DatasetVersion.current()
+        if before == after:
+            return before, rows
+    raise DatasetChanging("Station data is being reloaded; please retry.")
+
+
+def get_index() -> StationIndex:
+    """The snapshot for the current dataset version (rebuilt if the version changed)."""
     global _index
-    version = version or DatasetVersion.current()
-    if _index is None or _index.version != version:
+    current = DatasetVersion.current()
+    if _index is None or _index.version != current:
         with _lock:
-            if _index is None or _index.version != version:
-                rows = list(FuelStation.objects.values_list("opis_id", "lat", "lon", "price", "address"))
+            if _index is None or _index.version != current:
+                version, rows = _read_snapshot()
                 _index = StationIndex(rows, version)
     return _index
 

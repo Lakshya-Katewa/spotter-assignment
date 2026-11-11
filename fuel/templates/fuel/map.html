@@ -44,13 +44,13 @@
       <label>Start <input name="start" value="{{ start }}" placeholder="e.g. Chicago, IL" required></label>
       <label>Finish <input name="finish" value="{{ finish }}" placeholder="e.g. Dallas, TX" required></label>
       <label>Skip stops saving less than ($) <input name="min_stop_savings" value="{{ min_stop_savings }}" placeholder="0 = cheapest possible" inputmode="decimal"></label>
-      <label>Fuel in tank at start (gal) <input name="start_fuel_gallons" value="{{ start_fuel_gallons }}" placeholder="nearly empty if blank" inputmode="decimal"></label>
+      <label>Fuel in tank at start (gal) <input name="start_fuel_gallons" value="{{ start_fuel_gallons }}" placeholder="3 if blank" inputmode="decimal"></label>
       <button type="submit">Plan route</button>
     </form>
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
     {% if plan %}
       <div class="stats">
-        <div class="stat total"><b>${{ plan.summary.total_fuel_cost|floatformat:2 }}</b><span>Total fuel cost</span></div>
+        <div class="stat total"><b>${{ plan.summary.total_fuel_cost|floatformat:2 }}</b><span>Fuel bought on the trip</span></div>
         <div class="stat"><b>{{ plan.route.distance_miles|floatformat:0 }} mi</b><span>{{ plan.route.duration_hours|floatformat:1 }} h driving</span></div>
         <div class="stat"><b>{{ plan.summary.fuel_purchased_gallons|floatformat:1 }} gal</b><span>bought ({{ plan.summary.fuel_consumed_gallons|floatformat:1 }} used at {{ plan.meta.assumptions.miles_per_gallon|floatformat:0 }} mpg)</span></div>
         <div class="stat"><b>${{ plan.summary.average_price_per_gallon|floatformat:3 }}</b><span>Avg price / gal</span></div>
@@ -64,7 +64,7 @@
         {% for s in plan.fuel_stops %}
         <li data-stop="{{ forloop.counter0 }}">
           <span class="num">{{ s.stop }}</span>
-          <div><b>{{ s.name }}</b><div class="meta">{{ s.city }}, {{ s.state }} · mile {{ s.mile_marker|floatformat:0 }} · {{ s.access }}</div>
+          <div><b>{{ s.name }}</b><div class="meta">{{ s.city }}, {{ s.state }} · mile {{ s.mile_marker|floatformat:0 }} </div><div class="meta">{{ s.route_match }} (unverified)</div>
                <div class="meta">{{ s.address }}</div></div>
           <div class="right"><b>${{ s.cost|floatformat:2 }}</b><div class="meta">{{ s.gallons_purchased|floatformat:1 }} gal @ ${{ s.price_per_gallon|floatformat:3 }}</div></div>
         </li>
@@ -107,7 +107,7 @@
     L.marker([plan.finish.lat, plan.finish.lon], { icon: pin('B', 'end') }).bindPopup(popup(['Finish', plan.finish.query_label])).addTo(map);
     const markers = plan.fuel_stops.map(s => L.marker([s.lat, s.lon], { icon: pin(Number(s.stop)) })
       .bindPopup(popup([
-        s.stop + '. ' + s.name, s.address, s.city + ', ' + s.state, s.access,
+        s.stop + '. ' + s.name, s.address, s.city + ', ' + s.state, s.route_match + ' (unverified)',
         '$' + s.price_per_gallon.toFixed(3) + '/gal · ' + s.gallons_purchased.toFixed(1) + ' gal · $' + s.cost.toFixed(2),
       ]))
       .addTo(map));
