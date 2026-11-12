@@ -10,9 +10,13 @@ Each new route makes **one** call to the routing API. Plain `"City, ST"` inputs 
 
 ## Summary
 
-- **Every gallon is paid for by default.** The vehicle starts with just enough fuel to reach its first stop, charged at that stop's price, so `total_fuel_cost` = route miles ÷ 10 × stop prices. Pass `start_fuel_gallons=50` to leave with a full tank that isn't billed.
+> **Two assumptions shape every result** (details in [Assumptions and limits](#assumptions-and-limits)):
+>
+> 1. **Starting fuel: the trip pays for every gallon by default.** The vehicle is assumed to start with just enough fuel to reach its first stop, and that fuel is charged at that stop's price, so `total_fuel_cost` = route miles ÷ 10 × stop prices. The assignment doesn't specify this. To start with a full tank that isn't billed, pass `start_fuel_gallons=50` (or set `DEFAULT_START_FUEL_GALLONS=50`).
+> 2. **Station coordinates are approximate.** The price file has no coordinates. Each station is placed at its matched interstate exit from OpenStreetMap (48%) or at its city centre from Census data (52%), not at the pump itself. Mile markers, distances from the route and the 500-mile feasibility of a plan are therefore estimates (`is_estimate: true`), and detours to the pump are not charged.
+
 - **Optimal, with few stops.** A greedy optimizer finds the cheapest plan (checked against a brute-force solver in tests). By default it then removes stops that save less than $5 (NY→LA: 9 stops instead of 17, for $5.40 more). `min_stop_savings=0` returns the strictly cheapest plan.
-- **Station positions are derived offline.** The price file has no coordinates. Stations are placed at their matched interstate exit from OpenStreetMap (48%) or at their city centre from Census data (52%). Only stations with evidence they can be reached from the route are used.
+- **Only reachable stations are used.** A station counts only with evidence it can be reached from the route: its matched exit is within 1 mile of the route, or its address names a highway the route drives.
 - **Data limits are reported, not hidden.** The price file has almost no stations in California and none near Houston. Such trips return a clear warning or a 422 with the route still included.
 - **Quick check:** `python manage.py test fuel` (103 tests, offline) and the Postman collection in `postman_collection.json`.
 
