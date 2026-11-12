@@ -78,7 +78,7 @@
         </li>
         {% endfor %}
       </ol>
-      <small class="note">Estimate. Range {{ plan.meta.assumptions.max_range_miles|floatformat:0 }} mi; starting fuel: {{ plan.meta.assumptions.starting_fuel }}.
+      <small class="note">Estimate. Range {{ plan.meta.assumptions.max_range_miles|floatformat:0 }} mi; starting fuel: {{ plan.meta.assumptions.starting_fuel }}
         {{ plan.summary.stops_located_at_exit }} of {{ plan.summary.number_of_stops }} stops are placed at their matched interstate exit (OpenStreetMap junction, not the pump's exact spot); the rest at their city centre. {% if plan.meta.cached %}Served from cache.{% endif %}
         Computed in {{ plan.meta.elapsed_ms }} ms.</small>
     {% endif %}

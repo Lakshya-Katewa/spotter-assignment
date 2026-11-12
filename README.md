@@ -3,10 +3,10 @@
 A Django API that takes a start and finish location in the USA and returns:
 
 - the driving route (GeoJSON) and a link to an interactive map,
-- where to fuel up along the way at the lowest total cost, for a vehicle with a **500-mile range** (50-gallon tank),
+- cost-effective fuel stops along the way for a vehicle with a **500-mile range** (50-gallon tank): by default the cheapest plan with stops saving under $5 merged away, or the strictly cheapest plan with `min_stop_savings=0`,
 - the **total fuel cost** at **10 miles per gallon**.
 
-Each new route makes **one** call to the routing API. Plain `"City, ST"` inputs are resolved locally and make no geocoding call. Repeated requests are served from cache in about 2 ms.
+Each new route makes **one** call to the routing API. Plain `"City, ST"` inputs are resolved locally with no geocoding call, except for the ~0.2% of place names whose Census point isn't usable (e.g. San Francisco, whose point is offshore), which take one cached geocoding lookup. Repeated requests are served from cache in about 2 ms.
 
 ## Summary
 
@@ -15,8 +15,8 @@ Each new route makes **one** call to the routing API. Plain `"City, ST"` inputs 
 > 1. **Starting fuel: the trip pays for every gallon by default.** The vehicle is assumed to start with just enough fuel to reach its first stop, and that fuel is charged at that stop's price, so `total_fuel_cost` = route miles ÷ 10 × stop prices. The assignment doesn't specify this. To start with a full tank that isn't billed, pass `start_fuel_gallons=50` (or set `DEFAULT_START_FUEL_GALLONS=50`).
 > 2. **Station coordinates are approximate.** The price file has no coordinates. Each station is placed at its matched interstate exit from OpenStreetMap (48%) or at its city centre from Census data (52%), not at the pump itself. Mile markers, distances from the route and the 500-mile feasibility of a plan are therefore estimates (`is_estimate: true`), and detours to the pump are not charged.
 
-- **Optimal, with few stops.** A greedy optimizer finds the cheapest plan (checked against a brute-force solver in tests). By default it then removes stops that save less than $5 (NY→LA: 9 stops instead of 17, for $5.40 more). `min_stop_savings=0` returns the strictly cheapest plan.
-- **Only reachable stations are used.** A station counts only with evidence it can be reached from the route: its matched exit is within 1 mile of the route, or its address names a highway the route drives.
+- **Cheapest plan, then fewer stops.** A greedy optimizer finds the strictly cheapest plan (checked against a brute-force solver in tests). By default it then removes stops that save less than $5 (NY→LA: 9 stops instead of 17, for $5.40 more). `min_stop_savings=0` returns the strictly cheapest plan.
+- **Only stations with evidence of route access are used.** A station counts if its matched exit is within 1 mile of the route, its address names an I-/US- highway the route drives nearby, or its city centre is within 2 miles of the route. This is evidence from approximate positions, not verified access: exit direction and the detour to the pump are not checked.
 - **Data limits are reported, not hidden.** The price file has almost no stations in California and none near Houston. Such trips return a clear warning or a 422 with the route still included.
 - **Quick check:** `python manage.py test fuel` (108 tests, offline) and the Postman collection in `postman_collection.json`.
 

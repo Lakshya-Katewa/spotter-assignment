@@ -58,7 +58,8 @@ class RouteQuerySerializer(serializers.Serializer):
 
 class RoutePlanView(APIView):
     """
-    Route between two US locations with the cheapest fuel stops.
+    Route between two US locations with cost-effective fuel stops
+    (strictly cheapest with min_stop_savings=0).
 
     GET  /api/route/?start=Chicago, IL&finish=Dallas, TX
     POST /api/route/  {"start": "...", "finish": "..."}

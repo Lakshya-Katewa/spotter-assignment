@@ -251,7 +251,7 @@ def _compute(a, b, min_stop_savings, start_fuel_gallons, index) -> dict:
                 f"{plan.start_fuel_gallons:.1f} gallons, charged at that station's price."
             )
     else:
-        start_mode = f"{start_fuel_gallons:g} gallons already in the tank (given by the caller; not paid for on this trip)"
+        start_mode = f"{start_fuel_gallons:g} gallons already in the tank (given by the caller; not paid for on this trip)."
         cost_note = "fuel purchased during the trip; the fuel already in the tank at the start is not included"
 
     return {
