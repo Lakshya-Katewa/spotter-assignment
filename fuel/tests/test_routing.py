@@ -42,6 +42,16 @@ class RoutingClientTests(NoRateLimitMixin, SimpleTestCase):
         self.assertTrue(again.from_cache)
 
     @mock.patch("fuel.services.routing.requests.get")
+    def test_cache_is_per_routing_provider(self, get):
+        get.return_value = osrm_response(payload=OSRM_OK)
+        routing.get_route(38.5, -120.2, 40.7, -120.95)
+        with override_settings(OSRM_URL="https://osrm.example.internal"):
+            route = routing.get_route(38.5, -120.2, 40.7, -120.95)
+        self.assertFalse(route.from_cache)
+        self.assertEqual(get.call_count, 2)
+        self.assertTrue(get.call_args.args[0].startswith("https://osrm.example.internal/"))
+
+    @mock.patch("fuel.services.routing.requests.get")
     def test_upstream_failures(self, get):
         cases = [
             (osrm_response(400, {"code": "NoRoute", "message": "Impossible route"}), 422),
@@ -131,7 +141,7 @@ class OsrmPolicyTests(SimpleTestCase):
         payload["routes"][0]["geometry"] = encode(long_line)
         get.return_value = osrm_response(payload=payload)
         fresh = routing.get_route(38.5, -120.2, 40.7, -120.95)
-        stored = cache.get("route:38.50000,-120.20000:40.70000,-120.95000")
+        stored = cache.get(routing.cache_key(38.5, -120.2, 40.7, -120.95))
         self.assertIsInstance(stored.polyline, str)
         self.assertLess(len(pickle.dumps(stored)), len(pickle.dumps(fresh)) / 4)
         again = routing.get_route(38.5, -120.2, 40.7, -120.95)

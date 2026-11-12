@@ -7,12 +7,16 @@ from decimal import Decimal
 from unittest import mock
 
 import requests
+from django.conf import settings as django_settings
 from django.core.cache import cache
 from django.test import override_settings
 from rest_framework.throttling import AnonRateThrottle
 
+from config import settings as project_settings  # the module itself: unaffected by override_settings
 from fuel.models import DatasetVersion, FuelStation
 from fuel.services import routing
+from fuel.services.geo import Location
+from fuel.services.planner import PLAN_SETTINGS, plan_cache_key
 from fuel.services import stations as stations_module
 from fuel.services.stations import reset_index
 from fuel.tests.helpers import (
@@ -60,10 +64,47 @@ class ApiTests(ApiFixture):
         self.assertEqual(get_route.call_count, 1)
 
     @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
-    def test_default_is_strictly_cheapest(self, _):
+    def test_zero_min_stop_savings_is_strictly_cheapest(self, _):
+        # ApiFixture sets MIN_STOP_SAVINGS=0; the application default (5) is tested below.
         s = self.get().json()["summary"]
         self.assertEqual(s["total_fuel_cost"], s["cheapest_possible_cost"])
         self.assertEqual(s["extra_cost_for_fewer_stops"], 0)
+
+    @override_settings(MIN_STOP_SAVINGS=project_settings.MIN_STOP_SAVINGS)  # undo the fixture's override
+    @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
+    def test_application_default_is_min_stop_savings_5(self, _):
+        # Stop merging itself is tested in test_optimizer; here: omitting the parameter means 5.
+        self.assertEqual(project_settings.MIN_STOP_SAVINGS, 5)
+        default = self.get().json()
+        cache.clear()
+        explicit = self.get(min_stop_savings=5).json()
+        self.assertEqual(default["meta"]["min_stop_savings"], 5)
+        self.assertEqual(default["fuel_stops"], explicit["fuel_stops"])
+        self.assertEqual(default["summary"], explicit["summary"])
+        self.assertGreaterEqual(default["summary"]["extra_cost_for_fewer_stops"], 0)
+
+    @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
+    def test_cached_plan_not_reused_after_settings_change(self, _):
+        first = self.get().json()
+        self.assertAlmostEqual(first["summary"]["fuel_consumed_gallons"], 69.1, places=1)
+        with override_settings(VEHICLE_MPG=20):
+            second = self.get().json()
+        self.assertFalse(second["meta"]["cached"])
+        self.assertAlmostEqual(second["summary"]["fuel_consumed_gallons"], 34.55, places=1)
+
+    def test_map_form_describes_the_starting_fuel_default(self):
+        self.assertContains(self.client.get("/map/"), 'placeholder="Blank: estimate and bill starting fuel"')
+        with override_settings(DEFAULT_START_FUEL_GALLONS=50.0):
+            self.assertContains(self.client.get("/map/"), 'placeholder="50.0 if blank (not billed)"')
+
+    def test_every_plan_setting_is_in_the_cache_key(self):
+        a = b = Location(lat=40.0, lon=-100.0, label="x", source="local")
+        base = plan_cache_key("v1", a, b, 5, None)
+        for name in PLAN_SETTINGS:
+            value = getattr(django_settings, name)
+            changed = value + "/other" if isinstance(value, str) else value + 1
+            with override_settings(**{name: changed}):
+                self.assertNotEqual(plan_cache_key("v1", a, b, 5, None), base, name)
 
     @mock.patch("fuel.services.routing.get_route", side_effect=fake_route)
     def test_start_fuel_param(self, _):

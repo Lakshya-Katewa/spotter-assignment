@@ -1,5 +1,6 @@
 import logging
 
+from django.conf import settings
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.urls import reverse
@@ -122,6 +123,7 @@ def route_map(request):
     savings = request.GET.get("min_stop_savings", "").strip()
     start_fuel = request.GET.get("start_fuel_gallons", "").strip()
     ctx = {"start": start, "finish": finish, "min_stop_savings": savings, "start_fuel_gallons": start_fuel,
+           "default_start_fuel": settings.DEFAULT_START_FUEL_GALLONS,
            "plan": None, "route_only": None, "error": None}
     status = 200
     throttle = AnonRateThrottle()  # the page plans routes too, so it shares the API's limit

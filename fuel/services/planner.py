@@ -28,6 +28,33 @@ class PlanError(ValueError):
         self.partial = partial
 
 
+# Every setting that changes a plan. They are part of the plan cache key, so a shared
+# cache (Redis) that outlives a configuration change never serves a stale plan.
+PLAN_SETTINGS = (
+    "VEHICLE_MAX_RANGE_MILES",
+    "VEHICLE_MPG",
+    "STATION_CORRIDOR_MILES",
+    "STATION_NEAR_ROUTE_MILES",
+    "EXIT_NEAR_ROUTE_MILES",
+    "START_APPROACH_MILES",
+    "FEWER_STOPS_SUGGESTION_SAVINGS",
+    "OSRM_URL",
+)
+
+
+def plan_cache_key(dataset_version, a, b, min_stop_savings, start_fuel_gallons) -> str:
+    parts = [
+        "v3",
+        dataset_version,
+        f"{a.lat:.5f},{a.lon:.5f}",
+        f"{b.lat:.5f},{b.lon:.5f}",
+        f"{min_stop_savings:g}",
+        str(start_fuel_gallons),
+        *(repr(getattr(settings, name)) for name in PLAN_SETTINGS),
+    ]
+    return "plan:" + hashlib.sha1("|".join(parts).encode()).hexdigest()
+
+
 def build_plan(
     start: str,
     finish: str,
@@ -56,8 +83,7 @@ def build_plan(
         index = get_index()  # one consistent snapshot for the whole request
     except DatasetChanging as exc:
         raise PlanError(str(exc), 503) from exc
-    key_src = f"v2|{index.version}|{a.lat:.5f},{a.lon:.5f}|{b.lat:.5f},{b.lon:.5f}|{min_stop_savings:g}|{start_fuel_gallons}|{settings.START_APPROACH_MILES:g}"
-    cache_key = "plan:" + hashlib.sha1(key_src.encode()).hexdigest()
+    cache_key = plan_cache_key(index.version, a, b, min_stop_savings, start_fuel_gallons)
     result = cache.get(cache_key)
     cached = result is not None
     if not cached:

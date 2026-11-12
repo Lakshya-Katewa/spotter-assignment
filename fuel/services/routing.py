@@ -13,6 +13,7 @@ steps tell us which Interstate/US highways the route uses, and where.
   a controlled RoutingError (502) instead of an unhandled exception.
 """
 
+import hashlib
 import logging
 import math
 import time
@@ -66,8 +67,14 @@ def _ttl(value):
     return settings.ROUTE_CACHE_SECONDS
 
 
+def cache_key(start_lat, start_lon, end_lat, end_lon) -> str:
+    """Namespaced by routing provider, so switching OSRM_URL never serves another server's routes."""
+    provider = hashlib.sha1(settings.OSRM_URL.encode()).hexdigest()[:10]
+    return f"route:{provider}:{start_lat:.5f},{start_lon:.5f}:{end_lat:.5f},{end_lon:.5f}"
+
+
 def get_route(start_lat, start_lon, end_lat, end_lon) -> Route:
-    key = f"route:{start_lat:.5f},{start_lon:.5f}:{end_lat:.5f},{end_lon:.5f}"
+    key = cache_key(start_lat, start_lon, end_lat, end_lon)
     try:
         result, cached = singleflight.get_or_compute(
             key,

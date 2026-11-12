@@ -44,7 +44,7 @@
       <label>Start <input name="start" value="{{ start }}" placeholder="e.g. Chicago, IL" required></label>
       <label>Finish <input name="finish" value="{{ finish }}" placeholder="e.g. Dallas, TX" required></label>
       <label>Skip stops saving less than ($) <input name="min_stop_savings" value="{{ min_stop_savings }}" placeholder="5 if blank; 0 = cheapest" inputmode="decimal"></label>
-      <label>Fuel in tank at start (gal) <input name="start_fuel_gallons" value="{{ start_fuel_gallons }}" placeholder="empty if blank" inputmode="decimal"></label>
+      <label>Fuel in tank at start (gal) <input name="start_fuel_gallons" value="{{ start_fuel_gallons }}" placeholder="{% if default_start_fuel is None %}Blank: estimate and bill starting fuel{% else %}{{ default_start_fuel }} if blank (not billed){% endif %}" inputmode="decimal"></label>
       <button type="submit">Plan route</button>
     </form>
     {% if error %}<div class="error">{{ error }}</div>{% endif %}

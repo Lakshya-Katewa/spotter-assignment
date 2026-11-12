@@ -18,7 +18,7 @@ Each new route makes **one** call to the routing API. Plain `"City, ST"` inputs 
 - **Optimal, with few stops.** A greedy optimizer finds the cheapest plan (checked against a brute-force solver in tests). By default it then removes stops that save less than $5 (NY→LA: 9 stops instead of 17, for $5.40 more). `min_stop_savings=0` returns the strictly cheapest plan.
 - **Only reachable stations are used.** A station counts only with evidence it can be reached from the route: its matched exit is within 1 mile of the route, or its address names a highway the route drives.
 - **Data limits are reported, not hidden.** The price file has almost no stations in California and none near Houston. Such trips return a clear warning or a 422 with the route still included.
-- **Quick check:** `python manage.py test fuel` (103 tests, offline) and the Postman collection in `postman_collection.json`.
+- **Quick check:** `python manage.py test fuel` (108 tests, offline) and the Postman collection in `postman_collection.json`.
 
 ## Quick start
 
@@ -37,7 +37,7 @@ Then:
 
 - API: <http://127.0.0.1:8000/api/route/?start=New%20York,%20NY&finish=Los%20Angeles,%20CA>
 - Map: <http://127.0.0.1:8000/map/?start=New%20York,%20NY&finish=Los%20Angeles,%20CA>
-- Tests: `python manage.py test fuel` (103 tests in `fuel/tests/`, no network needed; CI runs them on every push)
+- Tests: `python manage.py test fuel` (108 tests in `fuel/tests/`, no network needed; CI runs them on every push)
 - Postman: import `postman_collection.json`
 - Health: <http://127.0.0.1:8000/healthz>
 
@@ -185,6 +185,7 @@ request ─► resolve start/finish ─► OSRM route (1 call, cached) ─► st
 
   A truck that really does leave the yard fuelled can pass `start_fuel_gallons` (e.g. `50` for a full tank). That fuel isn't billed, and `total_fuel_cost` then covers only what is bought on the way. To make the full tank the default for every request, set `DEFAULT_START_FUEL_GALLONS=50`.
 - **Data coverage.** The provided price file has only 8 stations in California (all in Imperial/Riverside County) and none in Hawaii, so many trips there can't be planned. For example, San Francisco → Los Angeles has no station anywhere along the route, so it returns 422 `no_stations_on_route`, still with the route and map. With `start_fuel_gallons=50` it returns a plan with no stops. This is a limit of the input data, not the planner.
+- **Routes can cross Canada.** Only the start and finish must be in the USA; the route is OSRM's fastest, wherever it goes. Detroit → Buffalo, for example, runs mostly through Ontario. The price file has no Canadian stations, so a Canadian stretch is a gap with no fuel stops, and the 500-mile range still applies across it. Keeping routes inside the USA would need a self-hosted router with a custom profile; the public OSRM server can't exclude a country.
 - **Arrive empty.** The plan buys only the fuel the trip needs.
 - Only Interstate and US routes are matched; state-route names differ too much between OSM and the price file. About 15% of stations name no I-/US- route, and they are used only when within 2 miles of the route.
 - Exit locations cover the contiguous US (the price file has no Alaska or Hawaii stations).
