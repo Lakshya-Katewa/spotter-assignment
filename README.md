@@ -8,6 +8,14 @@ A Django API that takes a start and finish location in the USA and returns:
 
 Each new route makes **one** call to the routing API. Plain `"City, ST"` inputs are resolved locally and make no geocoding call. Repeated requests are served from cache in about 2 ms.
 
+## Summary
+
+- **Every gallon is paid for by default.** The vehicle starts with just enough fuel to reach its first stop, charged at that stop's price, so `total_fuel_cost` = route miles ÷ 10 × stop prices. Pass `start_fuel_gallons=50` to leave with a full tank that isn't billed.
+- **Optimal, with few stops.** A greedy optimizer finds the cheapest plan (checked against a brute-force solver in tests). By default it then removes stops that save less than $5 (NY→LA: 9 stops instead of 17, for $5.40 more). `min_stop_savings=0` returns the strictly cheapest plan.
+- **Station positions are derived offline.** The price file has no coordinates. Stations are placed at their matched interstate exit from OpenStreetMap (48%) or at their city centre from Census data (52%). Only stations with evidence they can be reached from the route are used.
+- **Data limits are reported, not hidden.** The price file has almost no stations in California and none near Houston. Such trips return a clear warning or a 422 with the route still included.
+- **Quick check:** `python manage.py test fuel` (103 tests, offline) and the Postman collection in `postman_collection.json`.
+
 ## Quick start
 
 Requires **Python 3.12+** (Django 6.1's minimum; developed and tested on 3.14).
