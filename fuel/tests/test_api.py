@@ -240,7 +240,7 @@ class ApiHygieneTests(ApiFixture):
         self.assertIn("Retry-After", page)
         self.assertEqual(self.client.get("/map/").status_code, 200)  # the empty form isn't throttled
 
-    @mock.patch("fuel.services.routing.requests.get", side_effect=requests.ConnectionError("down"))
+    @mock.patch("fuel.services.routing._session.get", side_effect=requests.ConnectionError("down"))
     def test_failures_are_logged(self, _):
         logger = logging.getLogger("fuel")
         old = logger.level

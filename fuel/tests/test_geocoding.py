@@ -9,7 +9,9 @@ from django.test import TestCase, override_settings
 
 from fuel.models import Place
 from fuel.services import ratelimit
-from fuel.services.geo import GeocoderUnavailable, LocationError, resolve
+from fuel.models import DatasetVersion
+from fuel.services.geo import GeocoderUnavailable, LocationError, clear_local_cache, resolve
+from fuel.services.stations import get_index, reset_index
 from fuel.services.names import place_key
 from fuel.tests.helpers import (
     nominatim,
@@ -24,14 +26,28 @@ class GeocodingTests(TestCase):
 
     def setUp(self):
         cache.clear()
+        clear_local_cache()  # in-process "City, ST" memo: don't carry places between tests
 
-    @mock.patch("fuel.services.geo.requests.get")
+    @mock.patch("fuel.services.geo._session.get")
     def test_city_state_is_local(self, get):
         for q in ["Washington, DC", "washington, District of Columbia", "Washington, DC, USA", "Washington, DC 20500"]:
             self.assertEqual(resolve(q).source, "local", q)
         get.assert_not_called()
 
-    @mock.patch("fuel.services.geo.requests.get")
+    def test_local_result_is_memoized_until_the_dataset_changes(self):
+        reset_index()
+        get_index()
+        first = resolve("Washington, DC")
+        with self.assertNumQueries(0):
+            self.assertEqual(resolve("Washington, DC"), first)
+        # load_stations reloads places and publishes a new version; the next index
+        # rebuild (build_plan takes it before resolving) clears the memo.
+        Place.objects.filter(key=place_key("Washington", "DC")).update(lat=38.9)
+        DatasetVersion.objects.update_or_create(pk=1, defaults={"version": "reloaded"})
+        get_index()
+        self.assertEqual(resolve("Washington, DC").lat, 38.9)
+
+    @mock.patch("fuel.services.geo._session.get")
     def test_street_address_is_geocoded_not_collapsed_to_city(self, get):
         get.return_value = nominatim(38.8977, -77.0365, "White House")
         loc = resolve("1600 Pennsylvania Ave NW, Washington, DC")
@@ -39,7 +55,7 @@ class GeocodingTests(TestCase):
         self.assertAlmostEqual(loc.lat, 38.8977)
         self.assertEqual(get.call_count, 1)
 
-    @mock.patch("fuel.services.geo.requests.get")
+    @mock.patch("fuel.services.geo._session.get")
     def test_results_are_cached_including_misses(self, get):
         get.return_value = nominatim(38.8977, -77.0365)
         resolve("1600 Pennsylvania Ave NW, Washington, DC")
@@ -50,7 +66,7 @@ class GeocodingTests(TestCase):
                 resolve("Nowhere Street 1, Atlantis")
         self.assertEqual(get.call_count, 2)
 
-    @mock.patch("fuel.services.geo.requests.get")
+    @mock.patch("fuel.services.geo._session.get")
     def test_rate_limited_to_one_request_per_second(self, get):
         get.return_value = nominatim(38.8977, -77.0365)
         t0 = time.monotonic()
@@ -60,7 +76,7 @@ class GeocodingTests(TestCase):
         self.assertEqual(get.call_count, 2)
 
     @override_settings(GEOCODE_MAX_WAIT_SECONDS=0.1)
-    @mock.patch("fuel.services.geo.requests.get")
+    @mock.patch("fuel.services.geo._session.get")
     def test_busy_limiter_returns_503_instead_of_exceeding_rate(self, get):
         cache.set(ratelimit.last_call_key("nominatim"), time.time() + 60, timeout=120)  # next slot is a minute away
         with self.assertRaises(GeocoderUnavailable) as ctx:
@@ -68,12 +84,12 @@ class GeocodingTests(TestCase):
         self.assertEqual(ctx.exception.status, 503)
         get.assert_not_called()
 
-    @mock.patch("fuel.services.geo.requests.get", side_effect=requests.ConnectionError("down"))
+    @mock.patch("fuel.services.geo._session.get", side_effect=requests.ConnectionError("down"))
     def test_geocoder_outage_is_503(self, _):
         r = self.client.get("/api/route/", {"start": "4 Fourth St, Washington, DC", "finish": "Washington, DC"})
         self.assertEqual(r.status_code, 503)
 
-    @mock.patch("fuel.services.geo.requests.get")
+    @mock.patch("fuel.services.geo._session.get")
     def test_foreign_results_rejected(self, get):
         with self.assertRaises(LocationError):
             resolve("43.6532,-79.3832")  # Toronto: inside the old bounding box
@@ -96,9 +112,10 @@ class OffshorePlaceTests(TestCase):
 
     def setUp(self):
         cache.clear()
+        clear_local_cache()  # in-process "City, ST" memo: don't carry places between tests
 
     @mock.patch("fuel.services.ratelimit.acquire")
-    @mock.patch("fuel.services.geo.requests.get")
+    @mock.patch("fuel.services.geo._session.get")
     def test_offshore_centroid_falls_back_to_geocoding_the_city(self, get, _):
         cases = {"San Francisco, CA": (37.7793, -122.4193), "Honolulu, HI": (21.3069, -157.8583)}
         for query, (lat, lon) in cases.items():
@@ -109,13 +126,13 @@ class OffshorePlaceTests(TestCase):
             self.assertEqual(get.call_args.kwargs["params"]["q"], query)
         self.assertEqual(resolve("San Francisco, CA").source, "nominatim-cache")  # one lookup per city
 
-    @mock.patch("fuel.services.geo.requests.get")
+    @mock.patch("fuel.services.geo._session.get")
     def test_onshore_centroid_stays_local(self, get):
         self.assertEqual(resolve("Miami, FL").source, "local")
         get.assert_not_called()
 
     @mock.patch("fuel.services.ratelimit.acquire")
-    @mock.patch("fuel.services.geo.requests.get", side_effect=requests.ConnectionError("down"))
+    @mock.patch("fuel.services.geo._session.get", side_effect=requests.ConnectionError("down"))
     def test_fallback_outage_is_503_not_a_wrong_route(self, *_):
         r = self.client.get("/api/route/", {"start": "San Francisco, CA", "finish": "Miami, FL"})
         self.assertEqual(r.status_code, 503)

@@ -18,7 +18,7 @@ Each new route makes **one** call to the routing API. Plain `"City, ST"` inputs 
 - **Cheapest plan, then fewer stops.** A greedy optimizer finds the strictly cheapest plan (checked against a brute-force solver in tests). By default it then removes stops that save less than $5 (NY→LA: 9 stops instead of 17, for $5.40 more). `min_stop_savings=0` returns the strictly cheapest plan.
 - **Only stations with evidence of route access are used.** A station counts if its matched exit is within 1 mile of the route, its address names an I-/US- highway the route drives nearby, or its city centre is within 2 miles of the route. This is evidence from approximate positions, not verified access: exit direction and the detour to the pump are not checked.
 - **Data limits are reported, not hidden.** The price file has almost no stations in California and none near Houston. Such trips return a clear warning or a 422 with the route still included.
-- **Quick check:** `python manage.py test fuel` (108 tests, offline) and the Postman collection in `postman_collection.json`.
+- **Quick check:** `python manage.py test fuel` (114 tests, offline) and the Postman collection in `postman_collection.json`.
 
 ## Quick start
 
@@ -28,16 +28,16 @@ Requires **Python 3.12+** (Django 6.1's minimum; developed and tested on 3.14).
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env            # optional, the defaults work as-is
-python manage.py migrate
-python manage.py load_stations  # ~3 s, fully offline (all data ships in data/)
-python manage.py runserver
+python manage.py runserver      # first run sets up the database itself: ~5 s, fully offline
 ```
+
+On first start, `runserver` applies the migrations and loads the station data from `data/` (it's the same as running `migrate` and `load_stations`; `--skip-setup` turns this off). Only the development server does this; for a production server, run `python manage.py migrate` and `python manage.py load_stations` yourself.
 
 Then:
 
 - API: <http://127.0.0.1:8000/api/route/?start=New%20York,%20NY&finish=Los%20Angeles,%20CA>
 - Map: <http://127.0.0.1:8000/map/?start=New%20York,%20NY&finish=Los%20Angeles,%20CA>
-- Tests: `python manage.py test fuel` (108 tests in `fuel/tests/`, no network needed; CI runs them on every push)
+- Tests: `python manage.py test fuel` (114 tests in `fuel/tests/`, no network needed; CI runs them on every push)
 - Postman: import `postman_collection.json`
 - Health: <http://127.0.0.1:8000/healthz>
 
@@ -142,15 +142,15 @@ request ─► resolve start/finish ─► OSRM route (1 call, cached) ─► st
      - Every response field is validated; malformed data returns 502.
    - Every location must fall inside the Census US national boundary (`data/us_boundary.json`, from the 1:5,000,000-scale cartographic file `cb_2024_us_nation_5m`, checked locally in about 0.1 ms). Windsor, Tijuana and Juárez are rejected; Detroit, San Ysidro and El Paso are accepted.
    - A few real places (~0.2% of names) have a Census internal point that isn't a usable location. San Francisco's is offshore, because the city includes the Farallon Islands; "Honolulu" matches Honolulu CCD, centred in the Northwestern Hawaiian Islands. For these the city is geocoded instead: one cached Nominatim lookup.
-3. **Route.** One call to the public [OSRM](https://project-osrm.org/) server returns the full geometry (encoded polyline) and the route steps. The steps tell us which Interstate and US highways the route uses, and over which miles.
-   - Routes are cached for 24 hours. The cache keeps the encoded polyline (~120 KB for a cross-country route), not decoded coordinates (~780 KB); decoding on use takes ~20 ms.
+3. **Route.** One call to the public [OSRM](https://project-osrm.org/) server returns the route steps. The steps tell us which Interstate and US highways the route uses, and over which miles, and their geometries joined end to end are the full route line (identical to OSRM's `overview=full` line on the routes checked), so the line isn't downloaded twice.
+   - Routes are cached for 24 hours. The cache keeps the steps' encoded polylines (~120 KB for a cross-country route), not decoded coordinates (~780 KB); decoding on use takes ~10 ms (vectorized with numpy).
    - Calls are rate-limited to **1 per second**, as the demo server's usage policy requires (`fuel/services/ratelimit.py`, shared with Nominatim). Call starts are spaced at least 1.05 s apart. If no slot frees up within 5 seconds, the request returns 503 and the failure is not cached.
    - **Concurrent requests for the same uncached route share one upstream call** (`fuel/services/singleflight.py`): a lock in this process plus a cache lock, with the cache re-checked once the lock is held. Live test: 6 simultaneous cold requests made 1 OSRM call.
      - Within a process this always holds.
      - Across processes (shared cache) it holds unless the upstream call outlives the cache lock. The lock is sized to the worst case (rate-limit wait + connect timeout + read timeout + 5 s, ~30 s with the 10 s `EXTERNAL_TIMEOUT`), but an upstream that keeps trickling bytes could outlast it, and a waiter could then make a second call. So it is best-effort.
    - Failures are cached briefly (30 s for errors, 1 h for "no route"), so an outage doesn't cause a stampede.
    - The response is validated: distances must be finite and non-negative, the polyline must decode completely, and coordinates must be in range. Anything else returns 502, never 500. Malformed steps are skipped, because they only feed highway matching.
-4. **Stations on the route.** All stations are held in memory in an immutable snapshot: a KD-tree for exact great-circle queries, plus each station's details. A request uses one snapshot from start to finish, so a price reload mid-request can't mix two datasets. The route is densified to 1-mile steps, and stations within 15 miles are candidates.
+4. **Stations on the route.** All stations are held in memory in an immutable snapshot: a KD-tree for exact great-circle queries, plus each station's details. A request uses one snapshot from start to finish, so a price reload mid-request can't mix two datasets. The route is densified to 1-mile steps, and stations within 15 miles are candidates. The search runs one nearest-route-point query per station, capped at 15 miles (O(m log n) for m stations and n route points), instead of a radius search from every route point, which on a cross-country route returns ~750k intermediate hits.
    - **Station placed at its matched exit:** accepted only if the exit is within **1 mile** of the route. This is position evidence, the strongest we have, though it doesn't establish the pump's exact position, access direction or detour. On Chicago → Dallas, on-route exits measure ≤ 0.5 mi and exits on other interstates > 1 mi, so the threshold sits in a clear gap.
    - **Station at its city centre:** accepted if its address names an I-/US- highway the route drives within 15 miles of that point, or the centre is within 2 miles of the route. Being "near the route" alone is not evidence of access; a city 7 miles from I-80 whose station is on a state road is rejected.
 
@@ -195,7 +195,7 @@ request ─► resolve start/finish ─► OSRM route (1 call, cached) ─► st
   - The spacing uses stored timestamps, not key expiry, because some caches (Memcached) can expire a 1-second key early.
   - A per-client throttle on this API (map page included, default 60/min) limits abuse. It does **not** guarantee fair use of the upstream budget: one client making new routes as fast as allowed can still use all of it, and other clients then get 503 until a slot frees up. Preventing that would need per-client quotas on upstream calls, which is out of scope here.
   - Upstream failures are logged as warnings on the `fuel` logger.
-- **Deployment.** `DEBUG` defaults to on so reviewers can run this with no setup. With `DJANGO_DEBUG=0`, the app refuses to start unless `DJANGO_SECRET_KEY` is long and random (the dev default, the `.env.example` placeholder and short or repetitive keys are rejected), and it turns on secure cookies, an HTTPS redirect and proxy SSL header handling. Also set `DJANGO_ALLOWED_HOSTS`, `DJANGO_NUM_PROXIES` behind a reverse proxy (so throttling uses the client address, not the proxy's), and `REDIS_URL` for multiple workers. `manage.py check --deploy` then reports only the opt-in HSTS warning (`DJANGO_HSTS_SECONDS`). SQLite runs in WAL mode so requests aren't blocked while `load_stations` reloads prices; use Postgres for real traffic.
+- **Deployment.** `DEBUG` defaults to on so reviewers can run this with no setup. With `DJANGO_DEBUG=0`, the app refuses to start unless `DJANGO_SECRET_KEY` is long and random (the dev default, the `.env.example` placeholder and short or repetitive keys are rejected), and it turns on secure cookies, an HTTPS redirect and proxy SSL header handling. Also set `DJANGO_ALLOWED_HOSTS`, `DJANGO_NUM_PROXIES` behind a reverse proxy (so throttling uses the client address, not the proxy's), and `REDIS_URL` for multiple workers. `manage.py check --deploy` then reports only the opt-in HSTS warning (`DJANGO_HSTS_SECONDS`). SQLite runs in WAL mode so requests aren't blocked while `load_stations` reloads prices; use Postgres for real traffic. Production servers (e.g. gunicorn) never set up the database on their own: run `migrate` and `load_stations` as deploy steps.
 - **Upstream errors.** Timeouts are 10 s per connect/read (`EXTERNAL_TIMEOUT`). Error messages to clients are generic; the details are logged on the `fuel` logger.
 - **Attribution.** Routes and exit positions come from OpenStreetMap (ODbL); the API's `meta.attribution` and the map page credit it.
 
@@ -204,19 +204,28 @@ request ─► resolve start/finish ─► OSRM route (1 call, cached) ─► st
 | Stage | Time (NY → LA, 2,810 mi) |
 |---|---|
 | Resolve `"City, ST"` (local DB) + US-boundary check | ~2 ms |
-| OSRM route with steps (network) | ~1.2–1.8 s |
-| Corridor search + station matching | ~100 ms |
-| Optimizer | <1 ms |
-| Cached repeat request | ~2 ms |
+| OSRM route with steps (network) | ~1–1.8 s for NY → LA on an open connection (shorter routes ~0.3–0.7 s); the public server's latency varies a lot |
+| Everything else for an uncached plan: decode, corridor search, station matching, optimizer, simplified geometry | ~45 ms (was ~190 ms before vectorizing) |
+| Optimizer alone | <1 ms |
+| Cached repeat request | ~1 ms in the app, ~2–3 ms over HTTP (local "City, ST" lookups are memoized per process) |
 
 The public OSRM demo server accounts for almost all of the uncached time. For production, run your own OSRM instance (`OSRM_URL`) and set `REDIS_URL`.
+
+What was optimized, with outputs checked identical to the previous implementation on real routes and 20,000 random optimizer cases:
+
+- **HTTP connection reuse and warm-up.** OSRM and Nominatim calls go through one persistent `requests.Session` each, so the TLS handshake (~0.35 s of each OSRM call, measured) is paid once instead of on every new route. When the server starts, one `HEAD /` (not a routing request) opens the OSRM connection in the background, so even the first route skips the handshake (`OSRM_WARMUP=0` turns it off). There is no periodic keep-alive ping: idle connections stay open for over a minute, and pinging a free shared server just to keep a connection warm isn't fair use.
+- **No duplicate route line.** The request asks for the steps without the separate overview line and rebuilds the line from the step geometries: ~218 KB → ~134 KB on the wire for a cross-country route, and ~0.25 s off the median call (20 calls per setting on the public server). The steps themselves stay: without the highway evidence they give, 4 of 7 sample routes cost $1.30–1.90 more and lose 3–12% of their candidate stations.
+- **Optimizer: O(n log n).** A monotonic stack finds every station's next cheaper station in one O(n) pass, and a sparse table answers "cheapest station within range" in O(1). Each greedy step is then O(log n) (a binary search for the end of the range), instead of a linear scan ahead from every stop, and the tables are built once and shared by every first-stop candidate. At 30,000 stations: 307 ms before, 89 ms after; at today's ~300 candidates both take under 1 ms.
+- **Geometry in numpy, O(n) per pass.** Polyline decoding (27 → 8 ms), route densifying (one vectorized pass instead of a Python loop per segment) and Douglas–Peucker simplification (68 → 27 ms: each recursion level is one batch over all pending segments, instead of ~35k small numpy calls).
+- **Corridor search.** One capped nearest-neighbour query per station (6.6k queries) instead of a radius search from each of ~38k route points.
 
 ## Project layout
 
 ```
 config/                         Django settings and URLs
 fuel/models.py                  Place (Census centroids), FuelStation, DatasetVersion
-fuel/management/commands/       load_stations, build_exit_locations, build_us_boundary
+fuel/management/commands/       load_stations, build_exit_locations, build_us_boundary,
+                                runserver (sets up the database on first run)
 fuel/services/geo.py            start/finish resolution, geocode cache + rate limit
 fuel/services/boundary.py       offline point-in-US-polygon check
 fuel/services/routing.py        OSRM client: one call, validated, cached, coalesced

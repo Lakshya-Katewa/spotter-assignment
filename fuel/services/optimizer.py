@@ -9,8 +9,14 @@ The vehicle has a fixed range on a full tank. Greedy rule, applied at each stop:
 
 With linear prices and no detour cost this greedy plan is optimal: every
 mile is fuelled by the cheapest station that could have reached it.
+
+Complexity, for n stations: O(n log n) to precompute (see _Lookahead), then
+O(log n) per greedy step and at most n steps. A naive version that scans ahead
+from every stop is O(n * stations in range) per plan, and the pay-for-all-fuel
+mode runs one plan per possible first stop.
 """
 
+from bisect import bisect_right
 from dataclasses import dataclass, field
 
 EPS = 1e-9
@@ -39,6 +45,53 @@ class Stop:
     gallons: float
     cost: float
     fuel_on_arrival_gal: float
+
+
+class _Lookahead:
+    """Precomputed answers to the two questions the greedy rule asks at every stop.
+
+    pts: (key, mile, price) sorted by mile, at most one station per mile.
+
+    * next_cheaper[i]: the first station after i that is strictly cheaper, found for
+      all i in one right-to-left pass with a monotonic stack: O(n).
+    * cheapest(lo, hi): the cheapest station in pts[lo..hi] (ties: the farthest), from
+      a sparse table of range minimums: O(n log n) to build, O(1) per query.
+    * The stations within range of a stop are a contiguous run (pts is sorted by
+      mile), so its end is found by binary search: O(log n).
+    """
+
+    def __init__(self, pts):
+        self.pts = pts
+        self.miles = [p[1] for p in pts]
+        n = len(pts)
+
+        self.next_cheaper = [n] * n
+        stack = []  # indices to the right of i, prices strictly increasing from top to bottom
+        for i in range(n - 1, -1, -1):
+            while stack and pts[stack[-1]][2] >= pts[i][2] - EPS:  # not cheaper than i: never the answer again
+                stack.pop()
+            self.next_cheaper[i] = stack[-1] if stack else n
+            stack.append(i)
+
+        self.table = [list(range(n))]  # table[k][i] = cheapest index in pts[i : i + 2**k]
+        width = 1
+        while 2 * width <= n:
+            prev = self.table[-1]
+            self.table.append([self._better(prev[i], prev[i + width]) for i in range(n - 2 * width + 1)])
+            width *= 2
+
+    def _better(self, a, b):
+        """Cheaper station; on a price tie the farther one (it leaves more options ahead)."""
+        pa, pb = self.pts[a], self.pts[b]
+        return a if (pa[2], -pa[1]) <= (pb[2], -pb[1]) else b
+
+    def cheapest(self, lo, hi):
+        level = (hi - lo + 1).bit_length() - 1
+        return self._better(self.table[level][lo], self.table[level][hi - (1 << level) + 1])
+
+    def last_within(self, mile):
+        """Index of the last station at or before `mile` (-1 if none)."""
+        return bisect_right(self.miles, mile + EPS) - 1
 
 
 @dataclass
@@ -85,6 +138,7 @@ def plan_fuel_stops(stations, total_miles, max_range_miles, mpg, start_fuel_gall
             if m not in best_at or price < best_at[m][2]:
                 best_at[m] = (key, m, float(price))
     pts = sorted(best_at.values(), key=lambda s: s[1])
+    look = _Lookahead(pts)  # built once, shared by every first-stop candidate
 
     if billed_start:
         # A first stop must be before the destination (buying there buys nothing).
@@ -103,7 +157,7 @@ def plan_fuel_stops(stations, total_miles, max_range_miles, mpg, start_fuel_gall
         best, last_err = None, None
         for j in firsts:
             try:
-                cand = _plan_from(pts[j:], total_miles, max_range_miles, mpg, pts[j][1], billed_price=pts[j][2])
+                cand = _plan_from(look, j, total_miles, max_range_miles, mpg, pts[j][1], billed_price=pts[j][2])
             except NoFeasiblePlan as exc:
                 last_err = exc
                 continue
@@ -113,15 +167,17 @@ def plan_fuel_stops(stations, total_miles, max_range_miles, mpg, start_fuel_gall
         if best is None:
             raise last_err
         return best
-    return _plan_from(pts, total_miles, max_range_miles, mpg, start_fuel_gallons * mpg)
+    return _plan_from(look, 0, total_miles, max_range_miles, mpg, start_fuel_gallons * mpg)
 
 
-def _plan_from(pts, total_miles, max_range_miles, mpg, start_miles, billed_price=None):
-    """Greedy plan over sorted, de-duplicated `pts`, starting with `start_miles` of fuel.
+def _plan_from(look, first, total_miles, max_range_miles, mpg, start_miles, billed_price=None):
+    """Greedy plan over the sorted, de-duplicated stations look.pts[first:], starting
+    with `start_miles` of fuel.
 
     With `billed_price`, the starting fuel is charged at that price (pay-for-all-fuel mode,
-    where start_miles is exactly the distance to pts[0]).
+    where start_miles is exactly the distance to look.pts[first]).
     """
+    pts = look.pts
     bill = Plan(start_fuel_gallons=start_miles / mpg)
     if billed_price is not None:
         bill.start_fuel_cost = bill.start_fuel_gallons * billed_price
@@ -130,31 +186,31 @@ def _plan_from(pts, total_miles, max_range_miles, mpg, start_miles, billed_price
         bill.total_cost = bill.start_fuel_cost
         return bill
 
-    reachable = [k for k, s in enumerate(pts) if s[1] <= start_miles + EPS]
-    if not reachable:
-        first = f"mile {pts[0][1]:.0f}" if pts else "none on the route"
+    n = len(pts)
+    if first >= n or pts[first][1] > start_miles + EPS:
+        nearest = f"mile {pts[first][1]:.0f}" if first < n else "none on the route"
         raise NoFeasiblePlan(
             f"No fuel station within {start_miles:.0f} miles of the start, the range of the "
-            f"{start_miles / mpg:g} gallons in the tank (nearest: {first}).",
+            f"{start_miles / mpg:g} gallons in the tank (nearest: {nearest}).",
             0.0,
-            "start_fuel_too_low" if pts else "no_stations_on_route",
+            "start_fuel_too_low" if first < n else "no_stations_on_route",
         )
     # The start acts as a station we can't buy at, so every station is "cheaper":
     # the greedy rule says go to the first one.
-    i = reachable[0]
+    i = first
 
     plan = bill
     plan.total_cost = plan.start_fuel_cost
     fuel = start_miles - pts[i][1]  # range left on arrival (miles)
-    n = len(pts)
 
     while True:
         key, here, price = pts[i]
         horizon = here + max_range_miles
+        last = look.last_within(horizon)  # stations i+1..last are within range
 
         # First strictly cheaper station within range (or the destination, which is "free").
-        nxt = next((j for j in range(i + 1, n) if pts[j][1] > horizon + EPS or pts[j][2] < price - EPS), None)
-        if nxt is not None and pts[nxt][1] > horizon + EPS:
+        nxt = look.next_cheaper[i]
+        if nxt > last:
             nxt = None
         if nxt is None and total_miles <= horizon + EPS:
             buy = max(0.0, total_miles - here - fuel)
@@ -169,14 +225,13 @@ def _plan_from(pts, total_miles, max_range_miles, mpg, start_miles, billed_price
             continue
 
         # Nothing cheaper in range: fill up and go to the cheapest station in range.
-        in_range = [j for j in range(i + 1, n) if pts[j][1] <= horizon + EPS]
-        if not in_range:
+        if last <= i:
             raise NoFeasiblePlan(
                 f"No fuel station within {max_range_miles:.0f} miles after mile {here:.0f}; "
                 "the route cannot be completed on this vehicle's range.",
                 here,
             )
-        j = min(in_range, key=lambda k: (pts[k][2], -pts[k][1]))
+        j = look.cheapest(i + 1, last)
         buy = max_range_miles - fuel
         _add_stop(plan, key, here, price, buy, fuel, mpg)
         fuel = max_range_miles - (pts[j][1] - here)

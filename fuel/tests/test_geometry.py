@@ -32,7 +32,7 @@ class GeometryTests(SimpleTestCase):
         self.assertEqual(decode("_p~iF~ps|U_ulLnnqC_mqNvxq`@"), [[-120.2, 38.5], [-120.95, 40.7], [-126.453, 43.252]])
 
     def test_polyline_rejects_truncated_input(self):
-        for bad in ("_p~iF~ps|U_ul", "_p~iF", "\x00"):
+        for bad in ("_p~iF~ps|U_ul", "_p~iF", "\x00", "_p~iF~ps|Ué", "~~~~~~~~~"):
             with self.assertRaises(ValueError):
                 decode(bad)
 

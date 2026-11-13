@@ -72,8 +72,12 @@ OSRM_OK = {
     "routes": [{
         "distance": 160934.4,  # 100 miles
         "duration": 5400,
-        "geometry": "_p~iF~ps|U_ulLnnqC",
-        "legs": [{"steps": [{"distance": 120701, "ref": "I 5; US 99"}, {"distance": 40233.4, "ref": ""}]}],
+        # No overview line: the route line is the step geometries joined (the last step
+        # starts where the first ends, so the shared point appears once).
+        "legs": [{"steps": [
+            {"distance": 120701, "ref": "I 5; US 99", "geometry": "_p~iF~ps|U_ulLnnqC"},
+            {"distance": 40233.4, "ref": "", "geometry": "_flwFn`faV"},
+        ]}],
     }],
 }
 

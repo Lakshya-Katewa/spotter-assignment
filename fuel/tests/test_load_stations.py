@@ -3,9 +3,10 @@
 import os
 import tempfile
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
 from fuel.management.commands.load_stations import Command
+from fuel.models import FuelStation
 
 
 class DuplicatePriceTests(SimpleTestCase):
@@ -28,3 +29,25 @@ class DuplicatePriceTests(SimpleTestCase):
         self.assertEqual(str(stations[7]["price"]), "3.1000")
         self.assertEqual(str(stations[8]["price"]), "3.1000")  # even count: mean of the middle two
         self.assertNotIn(9, stations)
+
+
+class RunserverSetupTests(TestCase):
+    """`runserver` prepares a fresh database itself; nothing else changes the database."""
+
+    def test_runserver_is_ours(self):
+        from django.core.management import get_commands
+        self.assertEqual(get_commands()["runserver"], "fuel")
+
+    def test_loads_stations_only_when_missing(self):
+        from io import StringIO
+        from unittest import mock
+
+        from fuel.management.commands.runserver import prepare_database
+        with mock.patch("fuel.management.commands.runserver.call_command") as call:
+            prepare_database(StringIO())  # migrated test database, no stations yet
+        call.assert_called_once_with("load_stations")
+
+        FuelStation.objects.create(opis_id=1, name="X", address="I-1", city="X", state="NE", price="3.0", lat=40, lon=-100)
+        with mock.patch("fuel.management.commands.runserver.call_command") as call:
+            prepare_database(StringIO())
+        call.assert_not_called()

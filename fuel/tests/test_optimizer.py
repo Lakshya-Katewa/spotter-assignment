@@ -7,6 +7,7 @@ from django.test import SimpleTestCase
 
 from fuel.services.optimizer import (
     NoFeasiblePlan,
+    _Lookahead,
     consolidate_stops,
     plan_fuel_stops,
 )
@@ -216,3 +217,23 @@ class ConsolidationTests(SimpleTestCase):
                 self.assertGreaterEqual(merged.total_cost, plan.total_cost - 1e-6)
                 removed = len(plan.stops) - len(merged.stops)
                 self.assertLess(merged.total_cost - plan.total_cost, threshold * max(removed, 1) + 1e-6)
+
+
+class LookaheadTests(SimpleTestCase):
+    """The O(n log n) precomputation answers exactly what a linear scan would."""
+
+    def test_matches_naive_scans(self):
+        rnd = random.Random(21)
+        for _ in range(300):
+            n = rnd.randint(1, 60)
+            miles = sorted(rnd.sample(range(2000), n))
+            pts = [(k, float(m), rnd.choice([2.9, 3.0, 3.1, round(rnd.uniform(2.5, 4), 3)])) for k, m in enumerate(miles)]
+            look = _Lookahead(pts)
+            for i in range(n):
+                naive_next = next((j for j in range(i + 1, n) if pts[j][2] < pts[i][2]), n)
+                self.assertEqual(look.next_cheaper[i], naive_next)
+                for hi in range(i, n):
+                    naive = min(range(i, hi + 1), key=lambda k: (pts[k][2], -pts[k][1]))
+                    self.assertEqual(look.cheapest(i, hi), naive)
+            for mile in (-1.0, 0.0, miles[0], miles[-1], 2500.0):
+                self.assertEqual(look.last_within(mile), sum(m <= mile for m in miles) - 1)

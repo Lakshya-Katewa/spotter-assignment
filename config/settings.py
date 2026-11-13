@@ -51,6 +51,7 @@ ALLOWED_HOSTS = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1,testserve
 # Application definition
 
 INSTALLED_APPS = [
+    'fuel',  # first, so its runserver (sets up the database on first run) takes precedence
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -58,7 +59,6 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
-    'fuel',
 ]
 
 MIDDLEWARE = [
@@ -157,6 +157,8 @@ if DEBUG:
 
 # --- Fuel route planner -------------------------------------------------------
 OSRM_URL = os.getenv("OSRM_URL", "https://router.project-osrm.org").rstrip("/")
+# Open the routing connection when the server starts (one HEAD request; see routing.warm_up_connection).
+OSRM_WARMUP = os.getenv("OSRM_WARMUP", "1") != "0"
 NOMINATIM_URL = os.getenv("NOMINATIM_URL", "https://nominatim.openstreetmap.org/search")
 HTTP_USER_AGENT = os.getenv("HTTP_USER_AGENT", "fuel-route-planner/1.0 (Django assessment)")
 # Per connect/read timeout for OSRM and Nominatim. A cross-country OSRM route takes ~1.5 s.

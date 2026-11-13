@@ -75,14 +75,16 @@ def build_plan(
         raise PlanError(f"start_fuel_gallons must be between 0 and {tank:g}.")
 
     try:
+        # One consistent snapshot for the whole request. Taken first: a new dataset
+        # version also clears the in-process place cache that resolve() uses.
+        index = get_index()
+    except DatasetChanging as exc:
+        raise PlanError(str(exc), 503) from exc
+
+    try:
         a, b = geo.resolve(start), geo.resolve(finish)
     except geo.LocationError as exc:
         raise PlanError(str(exc), exc.status) from exc
-
-    try:
-        index = get_index()  # one consistent snapshot for the whole request
-    except DatasetChanging as exc:
-        raise PlanError(str(exc), 503) from exc
     cache_key = plan_cache_key(index.version, a, b, min_stop_savings, start_fuel_gallons)
     result = cache.get(cache_key)
     cached = result is not None

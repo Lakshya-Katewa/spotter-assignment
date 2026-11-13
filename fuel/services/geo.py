@@ -11,6 +11,7 @@ Every result must fall inside the US national boundary (checked offline). For a
 local Census match whose internal point is offshore, the city is geocoded instead.
 """
 
+import functools
 import hashlib
 import logging
 import math
@@ -43,6 +44,10 @@ STATE_NAMES = {
 STATE_CODES = set(STATE_NAMES.values())
 
 logger = logging.getLogger(__name__)
+# One persistent HTTP session: the TLS connection is reused between calls (kept open
+# by the server for over a minute), which saves ~0.35 s of handshake per call.
+# urllib3's connection pool is thread-safe for these plain GETs.
+_session = requests.Session()
 _LATLON = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
 
 
@@ -87,16 +92,33 @@ def resolve(query: str) -> Location:
     if "," in query and (tail in CANADIAN_PROVINCES or tail in {"CANADA", "MEXICO"}):
         raise LocationError(f"'{query}' is outside the USA.")
 
-    loc = _from_coordinates(query) or _from_local_places(query) or _from_nominatim(query)
-    if loc.source == "local" and not in_usa(loc.lat, loc.lon):
-        # A real US place whose Census internal point isn't a usable location: it is
-        # offshore (San Francisco includes the Farallon Islands) or far from the city
-        # ("Honolulu" matches Honolulu CCD, centred in the NW Hawaiian Islands).
-        # About 0.2% of names. Geocode the city instead (one cached lookup).
+    loc = _from_coordinates(query) or _local_in_usa(query)
+    if loc is None:
         loc = _from_nominatim(query)
-    if not in_usa(loc.lat, loc.lon):
+    if loc.source != "local" and not in_usa(loc.lat, loc.lon):  # local results are checked already
         raise LocationError(f"'{query}' is outside the USA.")
     return loc
+
+
+@functools.lru_cache(maxsize=4096)
+def _local_in_usa(query):
+    """A plain "City, ST" resolved from the local Census table, or None.
+
+    None also when the place's Census internal point isn't a usable location: it is
+    offshore (San Francisco includes the Farallon Islands) or far from the city
+    ("Honolulu" matches Honolulu CCD, centred in the NW Hawaiian Islands). About 0.2%
+    of names; the caller geocodes those instead (one cached lookup).
+
+    Memoized in-process (a DB query plus a point-in-polygon test per call otherwise):
+    the answer only changes when load_stations reloads the places, and the station
+    index clears this cache whenever it sees a new dataset version.
+    """
+    loc = _from_local_places(query)
+    return loc if loc is not None and in_usa(loc.lat, loc.lon) else None
+
+
+def clear_local_cache():
+    _local_in_usa.cache_clear()
 
 
 def _from_coordinates(query):
@@ -168,7 +190,7 @@ def _from_nominatim(query):
         except ratelimit.RateLimited:
             raise GeocoderUnavailable("Geocoder is busy; please retry in a moment.") from None
         try:
-            r = requests.get(
+            r = _session.get(
                 settings.NOMINATIM_URL,
                 params={"q": query, "countrycodes": "us", "format": "json", "limit": 1},
                 headers={"User-Agent": settings.HTTP_USER_AGENT},

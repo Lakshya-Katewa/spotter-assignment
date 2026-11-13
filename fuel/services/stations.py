@@ -15,6 +15,7 @@ from scipy.spatial import cKDTree
 
 from fuel.models import DatasetVersion, FuelStation
 from fuel.services import highways
+from fuel.services import geo
 from fuel.services.geo import EARTH_RADIUS_MI
 
 _lock = threading.Lock()
@@ -95,14 +96,19 @@ class StationIndex:
         if self.tree is None or len(pts) == 0:
             return [], cum
 
+        # One nearest-route-point query per station, cut off at the corridor width.
+        # A station is in the corridor exactly when its nearest route point is, so this
+        # equals a radius search from every route point, without its ~750k intermediate
+        # hits on a cross-country route: O(m log n) for m stations and n route points.
         route_xyz = _to_xyz(pts[:, 1], pts[:, 0])
-        hits = self.tree.query_ball_point(route_xyz, r=float(_chord(corridor_miles)))
-        idx = np.unique(np.fromiter((i for h in hits for i in h), dtype=np.int64))
+        radius = float(_chord(corridor_miles))
+        dist, nearest = cKDTree(route_xyz).query(self.tree.data, distance_upper_bound=np.nextafter(radius, np.inf))
+        idx = np.flatnonzero(dist <= radius)
         if idx.size == 0:
             return [], cum
+        dist, nearest = dist[idx], nearest[idx]
 
-        # Position each nearby station at its closest route point.
-        dist, nearest = cKDTree(route_xyz).query(self.tree.data[idx])
+        # Each nearby station is positioned at its closest route point.
         candidates = [
             Candidate(int(self.ids[i]), float(cum[n]), float(_arc_miles(d)), float(self.price[i]), self.highways[i])
             for i, n, d in zip(idx, nearest, dist)
@@ -130,8 +136,10 @@ def densify(coordinates, step_miles=1.0):
 
     pieces = np.maximum(1, np.ceil(seg / step_miles).astype(int))
     # For each segment, fractions 0, 1/k, ..., (k-1)/k; then append the final point.
+    # Vectorized: position of each output point within its segment, divided by k.
     seg_idx = np.repeat(np.arange(len(seg)), pieces)
-    frac = np.concatenate([np.arange(k) / k for k in pieces])
+    first_of_seg = np.cumsum(pieces) - pieces
+    frac = (np.arange(len(seg_idx)) - first_of_seg[seg_idx]) / pieces[seg_idx]
     pts = line[seg_idx] + (line[seg_idx + 1] - line[seg_idx]) * frac[:, None]
     pts = np.vstack([pts, line[-1]])
 
@@ -171,9 +179,11 @@ def get_index() -> StationIndex:
             if _index is None or _index.version != current:
                 version, rows = _read_snapshot()
                 _index = StationIndex(rows, version)
+                geo.clear_local_cache()  # places may have been reloaded with the stations
     return _index
 
 
 def reset_index():
     global _index
     _index = None
+    geo.clear_local_cache()

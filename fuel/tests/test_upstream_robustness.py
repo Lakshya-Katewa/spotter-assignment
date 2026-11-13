@@ -31,7 +31,7 @@ class ConcurrencyTests(SimpleTestCase):
             time.sleep(0.3)
             return osrm_response(payload=OSRM_OK)
 
-        with mock.patch("fuel.services.routing.requests.get", side_effect=slow_osrm):
+        with mock.patch("fuel.services.routing._session.get", side_effect=slow_osrm):
             results, errors = run_concurrently(lambda: routing.get_route(38.5, -120.2, 40.7, -120.95))
         self.assertEqual(errors, [])
         self.assertEqual(len(results), 8)
@@ -43,7 +43,7 @@ class ConcurrencyTests(SimpleTestCase):
             time.sleep(0.3)  # all 8 requests arrive while the first call is still failing
             raise requests.ConnectionError("down")
 
-        with mock.patch("fuel.services.routing.requests.get", side_effect=slow_failure) as get:
+        with mock.patch("fuel.services.routing._session.get", side_effect=slow_failure) as get:
             _, errors = run_concurrently(lambda: routing.get_route(38.5, -120.2, 40.7, -120.95))
         self.assertEqual(len(errors), 8)
         self.assertTrue(all(isinstance(e, routing.RoutingError) and e.status == 502 for e in errors))
@@ -60,7 +60,7 @@ class ConcurrencyTests(SimpleTestCase):
             time.sleep(0.2)
             return nominatim(38.8977, -77.0365)
 
-        with mock.patch("fuel.services.geo.requests.get", side_effect=slow_nominatim) as get:
+        with mock.patch("fuel.services.geo._session.get", side_effect=slow_nominatim) as get:
             results, errors = run_concurrently(lambda: resolve("1600 Pennsylvania Ave NW, Washington, DC"))
         self.assertEqual(errors, [])
         self.assertEqual(get.call_count, 1)
@@ -83,36 +83,49 @@ class MalformedUpstreamTests(NoRateLimitMixin, SimpleTestCase):
 
     def test_malformed_osrm_responses_become_502(self):
         good = OSRM_OK["routes"][0]
+
+        def with_step_geometry(geometry):  # the route line comes from the step geometries
+            return {**good, "legs": [{"steps": [{"distance": 1609.344, "ref": "", "geometry": geometry}]}]}
+
         bad_routes = {
             "empty route object": {},
-            "truncated polyline": {**good, "geometry": "_p~iF~ps|U_ul"},
-            "invalid polyline chars": {**good, "geometry": "\x01\x02"},
-            "geometry not a string": {**good, "geometry": [[0, 0]]},
+            "truncated polyline": with_step_geometry("_p~iF~ps|U_ul"),
+            "invalid polyline chars": with_step_geometry("\x01\x02"),
+            "geometry not a string": with_step_geometry([[0, 0]]),
+            "step without geometry": {**good, "legs": [{"steps": [{"distance": 1609.344, "ref": "I 5"}]}]},
+            "no legs": {**good, "legs": []},
+            "leg without steps": {**good, "legs": [{"steps": []}]},
+            "step not an object": {**good, "legs": [{"steps": [None]}]},
             "negative distance": {**good, "distance": -5},
             "string distance": {**good, "distance": "abc"},
             "infinite duration": {**good, "duration": float("inf")},
             "boolean distance": {**good, "distance": True},
-            "single point but non-zero distance": {**good, "geometry": "_p~iF~ps|U"},
-            "coordinates out of range": {**good, "geometry": encode([[10.0, 95.0], [10.0, 96.0]])},
+            "single point but non-zero distance": with_step_geometry("_p~iF~ps|U"),
+            "coordinates out of range": with_step_geometry(encode([[10.0, 95.0], [10.0, 96.0]])),
         }
         for i, (name, route) in enumerate(bad_routes.items()):
             with self.subTest(name), mock.patch(
-                "fuel.services.routing.requests.get", return_value=osrm_response(payload={"code": "Ok", "routes": [route]})
+                "fuel.services.routing._session.get", return_value=osrm_response(payload={"code": "Ok", "routes": [route]})
             ):
                 with self.assertRaises(routing.RoutingError) as ctx:
                     routing.get_route(30 + i, -100, 31, -100)
                 self.assertEqual(ctx.exception.status, 502)
         for i, payload in enumerate([[1, 2], "text", None, {"code": "Ok"}, {"code": "Ok", "routes": "x"}, {"code": "Ok", "routes": [3]}]):
             with self.subTest(payload=payload), mock.patch(
-                "fuel.services.routing.requests.get", return_value=osrm_response(payload=payload)
+                "fuel.services.routing._session.get", return_value=osrm_response(payload=payload)
             ):
                 with self.assertRaises(routing.RoutingError):
                     routing.get_route(45 + i, -100, 46, -100)
 
-    def test_malformed_steps_are_ignored_not_fatal(self):
-        route = {**OSRM_OK["routes"][0], "legs": [{"steps": [{"distance": "x", "ref": "I 5"}, None, {"distance": 1609.344, "ref": 7}]}, "junk"]}
+    def test_malformed_step_distance_or_ref_is_ignored_not_fatal(self):
+        # Distance and ref only feed highway matching; the geometry is what must be valid.
+        line = "_p~iF~ps|U_ulLnnqC"
+        route = {**OSRM_OK["routes"][0], "legs": [{"steps": [
+            {"distance": "x", "ref": "I 5", "geometry": line}, {"distance": 1609.344, "ref": 7, "geometry": line},
+        ]}]}
         r = routing.parse_osrm(200, {"code": "Ok", "routes": [route]})
         self.assertEqual(r.highways, [])
+        self.assertEqual(len(r.coordinates), 4)  # no shared point: the second step starts elsewhere
 
     @override_settings(GEOCODE_MAX_WAIT_SECONDS=3)
     def test_malformed_nominatim_responses_become_502(self):
@@ -122,7 +135,7 @@ class MalformedUpstreamTests(NoRateLimitMixin, SimpleTestCase):
             r = mock.Mock(status_code=200)
             r.raise_for_status.return_value = None
             r.json.return_value = payload
-            with self.subTest(name), mock.patch("fuel.services.geo.requests.get", return_value=r):
+            with self.subTest(name), mock.patch("fuel.services.geo._session.get", return_value=r):
                 with self.assertRaises(GeocoderUnavailable) as ctx:
                     resolve(f"{i} Main St, Springfield, IL")
                 self.assertEqual(ctx.exception.status, 502)
